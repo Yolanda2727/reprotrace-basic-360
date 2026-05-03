@@ -11,11 +11,15 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import io, zipfile, os
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from datetime import datetime, date, timedelta
 from textwrap import wrap
+
+@st.cache_resource
+def _get_plt():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    return _plt
 
 # ─── Constantes ──────────────────────────────────────────────────────────────
 DB_PATH   = "reprotrace_basic_360.db"
@@ -82,6 +86,7 @@ def query_df(q, p=()):
         c.close()
     return df
 
+@st.cache_resource
 def init_db():
     c = connect(); cur = c.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS instruments (
@@ -189,6 +194,7 @@ def fig_bytes(fig):
     buf=io.BytesIO(); fig.savefig(buf,format="png",bbox_inches="tight",dpi=150); buf.seek(0); return buf.read()
 
 def chart_complies(rec):
+    plt=_get_plt()
     data=rec.groupby("stage")["complies"].apply(lambda x:(x=="Sí").mean()*100)
     fig,ax=plt.subplots(figsize=(8,4)); data.plot(kind="bar",ax=ax,color="steelblue",edgecolor="white")
     ax.set_title("Cumplimiento por etapa (%)"); ax.set_ylabel("%"); ax.set_ylim(0,110)
@@ -196,6 +202,7 @@ def chart_complies(rec):
     ax.grid(axis="y",alpha=0.4); plt.tight_layout(); return fig
 
 def chart_time(rec):
+    plt=_get_plt()
     data=rec.groupby("stage")["duration_minutes"].mean()
     fig,ax=plt.subplots(figsize=(8,4)); data.plot(kind="bar",ax=ax,color="darkorange",edgecolor="white")
     ax.set_title("Tiempo promedio por etapa (min)"); ax.set_ylabel("Minutos")
@@ -203,6 +210,7 @@ def chart_time(rec):
     ax.grid(axis="y",alpha=0.4); plt.tight_layout(); return fig
 
 def chart_alerts(alerts):
+    plt=_get_plt()
     data=alerts["severity"].value_counts()
     clrs={"Alta":"#d9534f","Media":"#f0ad4e","Baja":"#5cb85c"}
     fig,ax=plt.subplots(figsize=(5,5))
@@ -210,6 +218,7 @@ def chart_alerts(alerts):
     ax.set_title("Alertas por severidad"); plt.tight_layout(); return fig
 
 def chart_survey(df):
+    plt=_get_plt()
     means=df[[f"q{i}" for i in range(1,11)]].mean().values
     fig,ax=plt.subplots(figsize=(8,4))
     ax.bar([f"P{i}" for i in range(1,11)],means,color="teal",edgecolor="white")
@@ -346,11 +355,11 @@ def generate_pdf():
     pdf.titulo("5. Gráficas e indicadores")
     if not rec.empty:
         for fn in [chart_complies, chart_time]:
-            fig=fn(rec); pdf.img_bytes(fig_bytes(fig)); plt.close(fig)
+            fig=fn(rec); pdf.img_bytes(fig_bytes(fig)); _get_plt().close(fig)
     pdf.titulo("6. Alertas críticas")
     if not alerts.empty:
         pdf.tabla(alerts[["instrument_code","batch_code","alert_type","severity","status","created_at"]])
-        fig=chart_alerts(alerts); pdf.img_bytes(fig_bytes(fig)); plt.close(fig)
+        fig=chart_alerts(alerts); pdf.img_bytes(fig_bytes(fig)); _get_plt().close(fig)
     else:
         pdf.parrafo("No se registraron alertas.")
     pdf.titulo("7. Plan de mejora")
@@ -358,7 +367,7 @@ def generate_pdf():
         pdf.tabla(plans[["finding","risk_level","corrective_action","state"]])
     pdf.titulo("8. Percepción del personal")
     if not survey.empty:
-        fig=chart_survey(survey); pdf.img_bytes(fig_bytes(fig)); plt.close(fig)
+        fig=chart_survey(survey); pdf.img_bytes(fig_bytes(fig)); _get_plt().close(fig)
     pdf.titulo("9. Conclusión técnica")
     pdf.parrafo("El prototipo ReproTrace Basic 360° demostró viabilidad para registrar, monitorear y trazar "
                 "instrumental quirúrgico. Las alertas permiten identificar desviaciones en tiempo real.")
@@ -425,7 +434,7 @@ def dashboard():
     st.write("  →  ".join(STAGES))
     if not rec.empty:
         st.subheader("Cumplimiento por etapa")
-        fig=chart_complies(rec); st.pyplot(fig); plt.close(fig)
+        fig=chart_complies(rec); st.pyplot(fig); _get_plt().close(fig)
     st.subheader("Últimas alertas abiertas")
     if not al.empty:
         for _,row in al.iterrows():
@@ -716,15 +725,15 @@ def reports_module():
         if fstage!="Todas": df=df[df["stage"]==fstage]
         if not df.empty:
             st.subheader("Cumplimiento por etapa")
-            fig=chart_complies(df); st.pyplot(fig); plt.close(fig)
+            fig=chart_complies(df); st.pyplot(fig); _get_plt().close(fig)
             st.subheader("Tiempo promedio por etapa")
-            fig=chart_time(df); st.pyplot(fig); plt.close(fig)
+            fig=chart_time(df); st.pyplot(fig); _get_plt().close(fig)
     if not alerts.empty:
         st.subheader("Distribución de alertas")
-        fig=chart_alerts(alerts); st.pyplot(fig); plt.close(fig)
+        fig=chart_alerts(alerts); st.pyplot(fig); _get_plt().close(fig)
     if not survey.empty:
         st.subheader("Percepción del personal")
-        fig=chart_survey(survey); st.pyplot(fig); plt.close(fig)
+        fig=chart_survey(survey); st.pyplot(fig); _get_plt().close(fig)
     st.subheader("Descargar reportes")
     col1,col2=st.columns(2)
     with col1:
@@ -765,7 +774,7 @@ def survey_module():
             st.success("¡Encuesta guardada!")
     df=query_df("SELECT * FROM staff_survey ORDER BY created_at DESC")
     if not df.empty:
-        fig=chart_survey(df); st.pyplot(fig); plt.close(fig)
+        fig=chart_survey(df); st.pyplot(fig); _get_plt().close(fig)
 
 # ─── Auditoría ────────────────────────────────────────────────────────────────
 def audit_module():
@@ -855,7 +864,9 @@ def limitations_module():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide")
-    init_db(); seed_demo_data()
+    init_db()
+    if not st.session_state.get("seeded"):
+        seed_demo_data(); st.session_state["seeded"] = True
     if "login" not in st.session_state: st.session_state["login"]=False
     if not st.session_state["login"]: login_screen(); return
     header()
