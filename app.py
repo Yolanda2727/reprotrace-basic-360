@@ -344,6 +344,27 @@ def apply_login_background():
     ::-webkit-scrollbar-thumb {{ background: #1e3a5f; border-radius: 3px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: #00d4ff; }}
 
+    /* ── Logo esquina superior derecha ── */
+    /* Para mover la posición cambia top/right. Para el tamaño cambia width en el HTML */
+    .corner-logo {{
+        position: fixed;
+        top: 18px;
+        right: 22px;
+        z-index: 9999;
+        opacity: 0.92;
+        transition: opacity 0.25s, transform 0.25s;
+    }}
+    .corner-logo:hover {{
+        opacity: 1;
+        transform: scale(1.06);
+    }}
+    .corner-logo img {{
+        width: 80px;   /* Cambia este valor para ajustar el tamaño del logo de esquina */
+        height: auto;
+        filter: drop-shadow(0 2px 12px rgba(0,212,255,0.5));
+        border-radius: 10px;
+    }}
+
     /* ── Alertas dentro del login ── */
     .stAlert {{
         border-radius: 10px !important;
@@ -351,6 +372,26 @@ def apply_login_background():
         background: rgba(180,83,9,0.12) !important;
     }}
     </style>
+    """, unsafe_allow_html=True)
+
+
+def show_corner_logo() -> None:
+    """
+    Muestra el logo 1833387-middle.png en la esquina superior derecha
+    de la pantalla de login, usando posición fija (CSS position: fixed).
+    - Para cambiar la imagen: reemplaza assets/1833387-middle.png.
+    - Para ajustar tamaño: edita width en la clase .corner-logo img del CSS.
+    - Si la imagen no existe, no muestra nada (sin errores).
+    """
+    # ── RUTA DEL LOGO DE ESQUINA ───────────────────────────────────────
+    corner_path = "assets/1833387-middle.png"
+    b64 = _img_to_base64(corner_path)
+    if not b64:
+        return  # Si no existe la imagen, no muestra nada
+    st.markdown(f"""
+    <div class="corner-logo">
+        <img src="data:image/png;base64,{b64}" alt="Logo institucional" />
+    </div>
     """, unsafe_allow_html=True)
 
 
@@ -1117,6 +1158,9 @@ def login_screen():
     """
     # ── Aplicar fondo y estilos del login ───────────────────────────────────
     apply_login_background()
+
+    # ── Logo en la esquina superior derecha ───────────────────────────────
+    show_corner_logo()
 
     # ── Mostrar tarjeta principal de login ──────────────────────────────────
     render_login_card()
