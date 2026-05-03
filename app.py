@@ -10,7 +10,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import io, zipfile, os
+import io, zipfile, os, base64
 from datetime import datetime, date, timedelta
 from textwrap import wrap
 
@@ -21,7 +21,412 @@ def _get_plt():
     import matplotlib.pyplot as _plt
     return _plt
 
-# ─── CSS Tecnológico ─────────────────────────────────────────────────────────
+# =============================================================================
+# FUNCIONES DE IMÁGENES Y ESTILOS
+# Para cambiar el logo: reemplaza assets/Logo.png
+# Para cambiar el fondo: reemplaza assets/imagen de fondo de pantalla.png
+# =============================================================================
+
+def _img_to_base64(path: str) -> str | None:
+    """Convierte una imagen local a base64 para usar en CSS/HTML."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def apply_login_background():
+    """
+    Aplica la imagen de fondo institucional en la pantalla de login.
+    - Carga assets/imagen de fondo de pantalla.png y la convierte a base64.
+    - La aplica como background-image con cover y overlay translúcido.
+    - Si la imagen no existe, usa un degradado azul como fallback.
+    - También oculta elementos de Streamlit no deseados en el login.
+    """
+    # ── RUTA DE LA IMAGEN DE FONDO ──────────────────────────────────────────
+    # Para cambiar el fondo, modifica la ruta de abajo:
+    bg_path = "assets/imagen de fondo de pantalla.png"
+    b64 = _img_to_base64(bg_path)
+
+    if b64:
+        # Fondo con imagen institucional convertida a base64
+        bg_css = f"""
+        background-image: url('data:image/png;base64,{b64}');
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+        """
+    else:
+        # Fallback: degradado azul si la imagen no se encuentra
+        bg_css = """
+        background: linear-gradient(135deg, #0a0e1a 0%, #0d2060 40%, #0a1628 100%);
+        """
+
+    # ── CSS COMPLETO PARA LA PANTALLA DE LOGIN ──────────────────────────────
+    # Aquí se define todo el estilo visual del login:
+    # - fondo de pantalla con overlay oscuro
+    # - tarjeta de acceso centrada con sombra y bordes redondeados
+    # - tipografía limpia y jerarquía visual
+    # - efecto hover en el botón
+    st.markdown(f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Share+Tech+Mono&display=swap');
+
+    /* ── Ocultar elementos de Streamlit innecesarios en el login ── */
+    #MainMenu, footer, header {{
+        visibility: hidden;
+    }}
+    [data-testid="stToolbar"] {{ display: none; }}
+    [data-testid="stDecoration"] {{ display: none; }}
+    .stDeployButton {{ display: none; }}
+
+    /* ── Fondo de pantalla completo con overlay oscuro-azul ── */
+    html, body {{
+        font-family: 'Inter', sans-serif;
+        margin: 0;
+        padding: 0;
+    }}
+    .stApp {{
+        {bg_css}
+    }}
+    /* Overlay azul oscuro semitransparente sobre el fondo */
+    .stApp::before {{
+        content: '';
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: linear-gradient(
+            135deg,
+            rgba(5, 10, 30, 0.82) 0%,
+            rgba(10, 30, 70, 0.75) 50%,
+            rgba(5, 15, 40, 0.85) 100%
+        );
+        z-index: 0;
+        pointer-events: none;
+    }}
+
+    /* ── Sidebar oculto / mínimo en login ── */
+    section[data-testid="stSidebar"] {{
+        display: none !important;
+    }}
+
+    /* ── Contenedor principal ── */
+    .block-container {{
+        padding-top: 2rem !important;
+        padding-bottom: 2rem !important;
+        position: relative;
+        z-index: 1;
+    }}
+
+    /* ── Tarjeta de login centrada ── */
+    /* Para cambiar colores de la tarjeta, modifica los valores de background y border abajo */
+    .login-card {{
+        background: linear-gradient(
+            145deg,
+            rgba(8, 20, 50, 0.92) 0%,
+            rgba(12, 28, 65, 0.95) 100%
+        );
+        border: 1px solid rgba(0, 180, 220, 0.35);
+        border-radius: 20px;
+        padding: 2.5rem 2.8rem;
+        box-shadow:
+            0 20px 60px rgba(0, 0, 0, 0.6),
+            0 0 40px rgba(0, 180, 220, 0.08),
+            inset 0 1px 0 rgba(255,255,255,0.07);
+        max-width: 520px;
+        margin: 0 auto;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+    }}
+
+    /* ── Logo dentro de la tarjeta ── */
+    .login-logo-wrap {{
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }}
+    .login-logo-wrap img {{
+        max-width: 150px;   /* Cambia este valor para ajustar el tamaño del logo */
+        height: auto;
+        filter: drop-shadow(0 4px 16px rgba(0,180,220,0.45));
+        border-radius: 12px;
+    }}
+
+    /* ── Separador visual ── */
+    .login-divider {{
+        border: none;
+        border-top: 1px solid rgba(0, 180, 220, 0.2);
+        margin: 0.8rem 0 1.2rem 0;
+    }}
+
+    /* ── Título principal ── */
+    .login-title {{
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 2rem;
+        color: #00d4ff;
+        text-shadow: 0 0 30px rgba(0,212,255,0.5);
+        text-align: center;
+        letter-spacing: 2px;
+        margin-bottom: 0.2rem;
+    }}
+
+    /* ── Subtítulo institucional ── */
+    .login-sub {{
+        text-align: center;
+        color: #7fb3d3;
+        font-size: 0.8rem;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        margin-bottom: 0.3rem;
+        line-height: 1.5;
+    }}
+
+    /* ── Lema de valor ── */
+    .login-tagline {{
+        text-align: center;
+        color: rgba(0, 212, 255, 0.75);
+        font-size: 0.78rem;
+        font-style: italic;
+        margin-bottom: 1rem;
+    }}
+
+    /* ── Badges académicos ── */
+    .badge-acad {{
+        display: inline-block;
+        background: rgba(0, 212, 255, 0.08);
+        border: 1px solid rgba(0, 212, 255, 0.25);
+        border-radius: 20px;
+        padding: 0.2rem 0.7rem;
+        font-size: 0.7rem;
+        color: #7fb3d3;
+        margin: 0.15rem;
+    }}
+
+    /* ── Inputs dentro del login ── */
+    .stTextInput > div > div > input {{
+        background: rgba(5, 15, 40, 0.9) !important;
+        border: 1px solid rgba(0, 180, 220, 0.3) !important;
+        border-radius: 10px !important;
+        color: #e2e8f0 !important;
+        padding: 0.6rem 1rem !important;
+    }}
+    .stTextInput > div > div > input:focus {{
+        border-color: #00d4ff !important;
+        box-shadow: 0 0 10px rgba(0,212,255,0.25) !important;
+    }}
+    .stTextInput label {{
+        color: #94a3b8 !important;
+        font-size: 0.85rem !important;
+    }}
+
+    /* ── Botón Ingresar con efecto hover ── */
+    /* Cambia los colores de gradient para personalizar el botón */
+    .stButton > button {{
+        background: linear-gradient(135deg, #0e4080 0%, #1a6fa8 100%) !important;
+        color: #ffffff !important;
+        border: 1px solid rgba(0, 212, 255, 0.5) !important;
+        border-radius: 10px !important;
+        font-weight: 700 !important;
+        font-size: 1rem !important;
+        letter-spacing: 1px !important;
+        padding: 0.65rem 1.5rem !important;
+        transition: all 0.25s ease !important;
+        box-shadow: 0 4px 15px rgba(0,100,200,0.3) !important;
+        width: 100% !important;
+    }}
+    .stButton > button:hover {{
+        background: linear-gradient(135deg, #1a6fa8 0%, #00d4ff 100%) !important;
+        color: #05101e !important;
+        box-shadow: 0 6px 25px rgba(0,212,255,0.45) !important;
+        transform: translateY(-2px) !important;
+    }}
+
+    /* ── Bloque de usuarios de prueba ── */
+    .login-demo-users {{
+        background: rgba(0, 50, 100, 0.35);
+        border: 1px solid rgba(0, 150, 200, 0.2);
+        border-radius: 10px;
+        padding: 0.8rem 1rem;
+        margin-top: 1rem;
+        font-size: 0.78rem;
+        color: #7fb3d3;
+        font-family: 'Share Tech Mono', monospace;
+    }}
+    .login-demo-users strong {{
+        color: #00d4ff;
+    }}
+
+    /* ── Nota académica ── */
+    .login-nota {{
+        background: rgba(30, 15, 0, 0.5);
+        border-left: 3px solid rgba(245, 158, 11, 0.6);
+        border-radius: 0 8px 8px 0;
+        padding: 0.7rem 1rem;
+        margin-top: 1rem;
+        font-size: 0.72rem;
+        color: rgba(220, 180, 100, 0.85);
+        line-height: 1.5;
+    }}
+
+    /* ── Footer discreto en login ── */
+    .login-footer {{
+        text-align: center;
+        color: rgba(100, 130, 160, 0.6);
+        font-size: 0.68rem;
+        margin-top: 1rem;
+    }}
+
+    /* ── Bienvenida superior ── */
+    .login-welcome {{
+        text-align: center;
+        color: rgba(200, 220, 240, 0.7);
+        font-size: 0.82rem;
+        margin-bottom: 1.5rem;
+        letter-spacing: 0.5px;
+    }}
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar {{ width: 6px; }}
+    ::-webkit-scrollbar-track {{ background: rgba(5,10,25,0.5); }}
+    ::-webkit-scrollbar-thumb {{ background: #1e3a5f; border-radius: 3px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: #00d4ff; }}
+
+    /* ── Alertas dentro del login ── */
+    .stAlert {{
+        border-radius: 10px !important;
+        border-left: 4px solid !important;
+        background: rgba(180,83,9,0.12) !important;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def show_logo(size_px: int = 150) -> str:
+    """
+    Devuelve HTML con el logo oficial.
+    - Para cambiar el logo, reemplaza assets/Logo.png.
+    - size_px controla el tamaño en píxeles.
+    - Si el logo no existe, muestra un emoji como fallback.
+    """
+    # ── RUTA DEL LOGO ───────────────────────────────────────────────────────
+    # Para cambiar el logo, modifica la ruta de abajo:
+    logo_path = "assets/Logo.png"
+    b64 = _img_to_base64(logo_path)
+
+    if b64:
+        return f"""
+        <div class="login-logo-wrap">
+            <img src="data:image/png;base64,{b64}" width="{size_px}"
+                 alt="Logo ReproTrace Basic 360°" />
+        </div>
+        """
+    else:
+        # Fallback visual si el logo no se encuentra
+        return f"""
+        <div class="login-logo-wrap" style="font-size:{size_px//3}px;padding:0.5rem 0">
+            🏥
+        </div>
+        """
+
+
+def render_login_card():
+    """
+    Renderiza la tarjeta de acceso completa del login:
+    - Logo, título, subtítulo, lema de valor.
+    - Campos de usuario y contraseña.
+    - Botón Ingresar con lógica de autenticación.
+    - Bloque con usuarios de prueba.
+    - Nota académica obligatoria.
+    - Footer institucional discreto.
+    """
+    # ── Mensaje de bienvenida (encima de la tarjeta) ────────────────────────
+    st.markdown("""
+    <div class="login-welcome">
+        Bienvenido al sistema académico de trazabilidad y reprocesamiento hospitalario.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Columnas para centrar la tarjeta ───────────────────────────────────
+    # Para desplazar la tarjeta, ajusta los ratios de las columnas:
+    col_l, col_card, col_r = st.columns([1, 2, 1])
+
+    with col_card:
+        # ── Logo oficial ──────────────────────────────────────────────────
+        st.markdown(show_logo(160), unsafe_allow_html=True)
+
+        # ── Título y subtítulos ───────────────────────────────────────────
+        st.markdown("""
+        <div class="login-title">ReproTrace Basic 360°</div>
+        <div class="login-sub">
+            Sistema de monitoreo y trazabilidad<br>
+            para centrales de reprocesamiento hospitalario
+        </div>
+        <div class="login-tagline">
+            Seguridad, calidad y trazabilidad en cada etapa del proceso.
+        </div>
+        <hr class="login-divider">
+        <div style="text-align:center;margin-bottom:1rem">
+            <span class="badge-acad">🎓 Universidad Libre · Barranquilla</span>
+            <span class="badge-acad">⚗️ Instrumentación Quirúrgica</span>
+            <span class="badge-acad">🔬 Prototipo Académico v2.0</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Campos de login ───────────────────────────────────────────────
+        # Usamos un contenedor para agrupar visualmente
+        u = st.text_input("👤  Usuario", key="li_user", placeholder="admin")
+        p = st.text_input("🔒  Contraseña", type="password", key="li_pass",
+                          placeholder="••••••••")
+
+        st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+
+        # ── Botón Ingresar ────────────────────────────────────────────────
+        if st.button("▶  Ingresar al sistema", use_container_width=True, key="btn_login"):
+            db_user = get_user(u)
+            if db_user and _check_password(p, db_user["password"]):
+                role = db_user["role"]
+                st.session_state.update({"login": True, "user": u, "role": role})
+                execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
+                        (u, role, "Inicio de sesión", datetime.now().isoformat()))
+                audit(u, "Inicio de sesión", "Login")
+                st.rerun()
+            elif u in USERS and USERS[u]["password"] == p:
+                role = USERS[u]["role"]
+                st.session_state.update({"login": True, "user": u, "role": role})
+                execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
+                        (u, role, "Inicio de sesión", datetime.now().isoformat()))
+                audit(u, "Inicio de sesión", "Login")
+                st.rerun()
+            else:
+                st.error("⚠️ Usuario o contraseña incorrectos.")
+
+        # ── Usuarios de prueba ────────────────────────────────────────────
+        st.markdown("""
+        <div class="login-demo-users">
+            <strong>Accesos de prueba:</strong><br>
+            🔑 admin / admin123 &nbsp;·&nbsp;
+            🔑 central / central123 &nbsp;·&nbsp;
+            🔑 docente / docente123
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Nota académica obligatoria ────────────────────────────────────
+        # El texto de esta nota está definido en la constante NOTA_ACAD
+        st.markdown(f"""
+        <div class="login-nota">
+            ⚠️ <strong>Nota académica:</strong> {NOTA_ACAD}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Footer institucional discreto ─────────────────────────────────
+        st.markdown("""
+        <div class="login-footer">
+            Desarrollado como prototipo académico para Instrumentación Quirúrgica &nbsp;·&nbsp;
+            Universidad Libre Seccional Barranquilla · 2026
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ─── CSS Tecnológico (panel interno post-login) ───────────────────────────────
 TECH_CSS = """
 <style>
 /* ── Fuente y fondo ── */
@@ -650,49 +1055,23 @@ def inst_footer():
 
 # ─── Pantalla de login ────────────────────────────────────────────────────────
 def login_screen():
-    st.markdown("""
-    <div class="login-card">
-        <div class="login-title">🏥 ReproTrace Basic 360°</div>
-        <div class="login-sub">Sistema de Trazabilidad de Instrumental Quirúrgico</div>
-        <div style="text-align:center;margin-bottom:1rem">
-            <span class="badge-acad">🎓 Universidad Libre Seccional Barranquilla</span>
-            <span class="badge-acad">⚗️ Instrumentación Quirúrgica</span>
-            <span class="badge-acad">🔬 Prototipo Académico v2.0</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown("")
-    st.warning(NOTA_ACAD)
-    with st.sidebar:
-        st.title("Acceso al sistema")
-        tab_login, tab_reg = st.tabs(["🔑 Ingresar", "📝 Registrarse"])
+    """
+    Pantalla de acceso principal.
+    - Aplica fondo institucional mediante apply_login_background().
+    - Muestra tarjeta de acceso elegante mediante render_login_card().
+    - El registro de nuevos usuarios se mantiene en un expander adicional.
+    """
+    # ── Aplicar fondo y estilos del login ───────────────────────────────────
+    apply_login_background()
 
-        with tab_login:
-            st.info("Usuarios de prueba: admin / admin123 · central / central123 · docente / docente123")
-            u = st.text_input("Usuario", key="li_user")
-            p = st.text_input("Contraseña", type="password", key="li_pass")
-            if st.button("Ingresar", use_container_width=True, key="btn_login"):
-                # Buscar primero en tabla BD, luego en USERS hardcoded
-                db_user = get_user(u)
-                if db_user and _check_password(p, db_user["password"]):
-                    role = db_user["role"]
-                    st.session_state.update({"login": True, "user": u, "role": role})
-                    execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
-                            (u, role, "Inicio de sesión", datetime.now().isoformat()))
-                    audit(u, "Inicio de sesión", "Login")
-                    st.rerun()
-                elif u in USERS and USERS[u]["password"] == p:
-                    role = USERS[u]["role"]
-                    st.session_state.update({"login": True, "user": u, "role": role})
-                    execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
-                            (u, role, "Inicio de sesión", datetime.now().isoformat()))
-                    audit(u, "Inicio de sesión", "Login")
-                    st.rerun()
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
+    # ── Mostrar tarjeta principal de login ──────────────────────────────────
+    render_login_card()
 
-        with tab_reg:
-            st.write("Cree su cuenta para acceder al sistema.")
+    # ── Registro de nuevos usuarios (expander discreto) ─────────────────────
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    _, col_reg, _ = st.columns([1, 2, 1])
+    with col_reg:
+        with st.expander("📝 ¿Nuevo usuario? Crear cuenta", expanded=False):
             rn = st.text_input("Nombre completo", key="rg_name")
             ru = st.text_input("Usuario (sin espacios)", key="rg_user")
             rp = st.text_input("Contraseña", type="password", key="rg_pass")
@@ -714,16 +1093,37 @@ def login_screen():
                         st.error(msg)
 
 def header():
+    """
+    Encabezado del panel interno post-login.
+    Muestra el Logo.png en el sidebar y en el header superior.
+    """
     now_str = datetime.now().strftime("%Y-%m-%d  %H:%M")
+
+    # ── Logo en el header superior ──────────────────────────────────────────
+    # Para cambiar el logo del encabezado, modifica show_logo() o assets/Logo.png
+    logo_html = show_logo(48)  # 48px en el header
     st.markdown(f"""
     <div class="rt-header">
-        <div>
-            <div class="rt-header-logo">🏥 {APP_NAME}</div>
-            <div class="rt-header-sub">Sistema de Trazabilidad · {VERSION}</div>
+        <div style="display:flex;align-items:center;gap:0.8rem">
+            <div style="line-height:0">{logo_html.replace('<div class="login-logo-wrap">','<div style="line-height:0">').replace('max-width: 150px','max-width:48px')}</div>
+            <div>
+                <div class="rt-header-logo">{APP_NAME}</div>
+                <div class="rt-header-sub">Sistema de Trazabilidad · {VERSION}</div>
+            </div>
         </div>
         <div class="rt-header-badge">🕐 {now_str}</div>
     </div>""", unsafe_allow_html=True)
-    # Sidebar usuario
+
+    # ── Logo y usuario en el sidebar ────────────────────────────────────────
+    logo_b64 = _img_to_base64("assets/Logo.png")
+    if logo_b64:
+        st.sidebar.markdown(f"""
+        <div style="text-align:center;padding:0.8rem 0 0.4rem 0">
+            <img src="data:image/png;base64,{logo_b64}" width="100"
+                 style="filter:drop-shadow(0 2px 8px rgba(0,180,220,0.4));border-radius:10px;"
+                 alt="Logo ReproTrace" />
+        </div>
+        """, unsafe_allow_html=True)
     st.sidebar.markdown(f"""
     <div style="background:rgba(0,212,255,0.08);border:1px solid #1e3a5f;border-radius:10px;
                 padding:0.8rem;margin-bottom:0.8rem;text-align:center;">
@@ -1212,13 +1612,17 @@ def limitations_module():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide",
-                       initial_sidebar_state="expanded")
-    st.markdown(TECH_CSS, unsafe_allow_html=True)
+                       initial_sidebar_state="collapsed")
     init_db()
     if not st.session_state.get("seeded"):
         seed_demo_data(); st.session_state["seeded"] = True
     if "login" not in st.session_state: st.session_state["login"]=False
-    if not st.session_state["login"]: login_screen(); return
+    if not st.session_state["login"]:
+        # En el login NO se aplica el TECH_CSS (tiene su propio estilo)
+        login_screen()
+        return
+    # Panel interno: aplicar el CSS tecnológico
+    st.markdown(TECH_CSS, unsafe_allow_html=True)
     header()
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
