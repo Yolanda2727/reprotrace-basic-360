@@ -140,6 +140,14 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL, role TEXT NOT NULL,
         event TEXT NOT NULL, timestamp TEXT NOT NULL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        full_name TEXT,
+        role TEXT NOT NULL DEFAULT 'Personal de central',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT)""")
     c.commit(); c.close()
 
 def seed_demo_data():
@@ -161,6 +169,49 @@ def seed_demo_data():
 def audit(user, action, module, desc=""):
     execute("INSERT INTO audit_log(username,action,module,description,created_at) VALUES(?,?,?,?,?)",
             (user, action, module, desc, datetime.now().isoformat()))
+
+def _check_password(plain, stored):
+    """Compara contraseña plana con hash bcrypt o texto plano (usuarios hardcoded)."""
+    try:
+        import bcrypt
+        if stored.startswith("$2b$") or stored.startswith("$2a$"):
+            return bcrypt.checkpw(plain.encode(), stored.encode())
+    except ImportError:
+        pass
+    return plain == stored
+
+def _hash_password(plain):
+    """Genera hash bcrypt si disponible, sino devuelve texto plano."""
+    try:
+        import bcrypt
+        return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+    except ImportError:
+        return plain
+
+def get_user(username):
+    """Busca usuario en tabla BD. Retorna dict con password y role, o None."""
+    df = query_df("SELECT * FROM users WHERE username=? AND active=1", (username,))
+    if not df.empty:
+        row = df.iloc[0]
+        return {"password": row["password"], "role": row["role"], "full_name": row.get("full_name","")}
+    return None
+
+def register_user(username, password, full_name, role):
+    """Registra nuevo usuario. Retorna (True,'') o (False, msg_error)."""
+    if username in USERS:
+        return False, "Ese nombre de usuario está reservado."
+    existing = query_df("SELECT id FROM users WHERE username=?", (username,))
+    if not existing.empty:
+        return False, "El usuario ya existe."
+    if len(username) < 3:
+        return False, "El usuario debe tener al menos 3 caracteres."
+    if len(password) < 6:
+        return False, "La contraseña debe tener al menos 6 caracteres."
+    hashed = _hash_password(password)
+    execute("""INSERT INTO users(username,password,full_name,role,active,created_at)
+               VALUES(?,?,?,?,1,?)""",
+            (username.strip().lower(), hashed, full_name.strip(), role, datetime.now().isoformat()))
+    return True, ""
 
 def add_alert(code, batch, atype, sev, desc):
     execute("""INSERT INTO alerts(instrument_code,batch_code,alert_type,severity,description,status,created_at)
@@ -387,21 +438,57 @@ def inst_footer():
 def login_screen():
     st.title(APP_NAME)
     st.subheader("Sistema académico de monitoreo y trazabilidad del instrumental quirúrgico")
-    st.info("Usuarios de prueba:  admin / admin123  ·  central / central123  ·  docente / docente123")
     st.warning(NOTA_ACAD)
     st.markdown(inst_footer())
     with st.sidebar:
         st.title("Acceso al sistema")
-        u=st.text_input("Usuario"); p=st.text_input("Contraseña",type="password")
-        if st.button("Ingresar",use_container_width=True):
-            if u in USERS and USERS[u]["password"]==p:
-                st.session_state.update({"login":True,"user":u,"role":USERS[u]["role"]})
-                execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
-                        (u,USERS[u]["role"],"Inicio de sesión",datetime.now().isoformat()))
-                audit(u,"Inicio de sesión","Login")
-                st.rerun()
-            else:
-                st.error("Usuario o contraseña incorrectos.")
+        tab_login, tab_reg = st.tabs(["🔑 Ingresar", "📝 Registrarse"])
+
+        with tab_login:
+            st.info("Usuarios de prueba: admin / admin123 · central / central123 · docente / docente123")
+            u = st.text_input("Usuario", key="li_user")
+            p = st.text_input("Contraseña", type="password", key="li_pass")
+            if st.button("Ingresar", use_container_width=True, key="btn_login"):
+                # Buscar primero en tabla BD, luego en USERS hardcoded
+                db_user = get_user(u)
+                if db_user and _check_password(p, db_user["password"]):
+                    role = db_user["role"]
+                    st.session_state.update({"login": True, "user": u, "role": role})
+                    execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
+                            (u, role, "Inicio de sesión", datetime.now().isoformat()))
+                    audit(u, "Inicio de sesión", "Login")
+                    st.rerun()
+                elif u in USERS and USERS[u]["password"] == p:
+                    role = USERS[u]["role"]
+                    st.session_state.update({"login": True, "user": u, "role": role})
+                    execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
+                            (u, role, "Inicio de sesión", datetime.now().isoformat()))
+                    audit(u, "Inicio de sesión", "Login")
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
+        with tab_reg:
+            st.write("Cree su cuenta para acceder al sistema.")
+            rn = st.text_input("Nombre completo", key="rg_name")
+            ru = st.text_input("Usuario (sin espacios)", key="rg_user")
+            rp = st.text_input("Contraseña", type="password", key="rg_pass")
+            rp2 = st.text_input("Confirmar contraseña", type="password", key="rg_pass2")
+            rr = st.selectbox("Rol", ["Personal de central", "Docente/Tutor"], key="rg_role")
+            if st.button("Crear cuenta", use_container_width=True, key="btn_register"):
+                if not ru or not rp or not rn:
+                    st.error("Complete todos los campos.")
+                elif rp != rp2:
+                    st.error("Las contraseñas no coinciden.")
+                elif " " in ru:
+                    st.error("El usuario no puede tener espacios.")
+                else:
+                    ok, msg = register_user(ru, rp, rn, rr)
+                    if ok:
+                        st.success(f"✅ Cuenta creada. Ya puede ingresar con el usuario '{ru}'.")
+                        audit("sistema", "Registro de usuario", "Login", f"Nuevo usuario: {ru} / Rol: {rr}")
+                    else:
+                        st.error(msg)
 
 def header():
     st.title(APP_NAME); st.caption(NOTA_ACAD)
@@ -806,6 +893,29 @@ def config_module():
     st.subheader("Sesiones registradas")
     st.dataframe(query_df("SELECT * FROM login_sessions ORDER BY id DESC LIMIT 50"),use_container_width=True)
     if st.session_state.get("role")=="Administrador":
+        st.subheader("👥 Gestión de usuarios registrados")
+        users_df = query_df("SELECT id, username, full_name, role, active, created_at FROM users ORDER BY id DESC")
+        if users_df.empty:
+            st.info("No hay usuarios registrados aún.")
+        else:
+            st.dataframe(users_df, use_container_width=True)
+            st.write("**Activar / Desactivar usuario:**")
+            sel = st.selectbox("Seleccionar usuario", users_df["username"].tolist(), key="cfg_usr_sel")
+            col1, col2 = st.columns(2)
+            if col1.button("✅ Activar", use_container_width=True):
+                execute("UPDATE users SET active=1 WHERE username=?", (sel,))
+                audit(st.session_state["user"], "Activar usuario", "Config", f"Usuario activado: {sel}")
+                st.success(f"Usuario '{sel}' activado."); st.rerun()
+            if col2.button("🚫 Desactivar", use_container_width=True):
+                execute("UPDATE users SET active=0 WHERE username=?", (sel,))
+                audit(st.session_state["user"], "Desactivar usuario", "Config", f"Usuario desactivado: {sel}")
+                st.warning(f"Usuario '{sel}' desactivado."); st.rerun()
+            st.write("**Cambiar rol:**")
+            new_role = st.selectbox("Nuevo rol", ["Personal de central","Docente/Tutor","Administrador"], key="cfg_usr_role")
+            if st.button("Guardar rol", use_container_width=True):
+                execute("UPDATE users SET role=? WHERE username=?", (new_role, sel))
+                audit(st.session_state["user"], "Cambiar rol", "Config", f"{sel} → {new_role}")
+                st.success(f"Rol de '{sel}' actualizado a '{new_role}'."); st.rerun()
         st.subheader("⚠️ Zona de administración")
         st.warning("Solo para demostración académica. Acción irreversible.")
         confirm=st.text_input("Escriba CONFIRMAR para limpiar datos de prueba")
