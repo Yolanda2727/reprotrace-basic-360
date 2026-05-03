@@ -1,0 +1,19 @@
+flowchart TD
+    A[Recepción instrumental contaminado] --> B[Registro en ReproTrace Basic 360]
+    B --> C[Asignación código instrumental y lote]
+    C --> D[Limpieza y descontaminación]
+    D --> E{¿Limpieza cumple?}
+    E -- No --> D1[Alerta y repetir limpieza]
+    D1 --> D
+    E -- Sí --> F[Inspección funcional]
+    F --> G{¿Completo y funcional?}
+    G -- No --> G1[Alerta, retiro o mantenimiento]
+    G -- Sí --> H[Empaque e indicador químico]
+    H --> I[Esterilización: equipo, ciclo, temperatura, presión]
+    I --> J[Validación: indicadores físico, químico y biológico]
+    J --> K{¿Carga liberada?}
+    K -- No --> K1[Rechazo de carga y reproceso]
+    K1 --> D
+    K -- Sí --> L[Almacenamiento con ubicación y vencimiento]
+    L --> M[Distribución a servicio destino]
+    M --> N[Reporte final de trazabilidad]

@@ -1,0 +1,8 @@
+Prueba,Procedimiento,Criterio de aprobación
+Funcionamiento,Registrar las ocho etapas,Todas quedan guardadas
+Secuencia,Registrar etapa sin previa,Advierte ruta incompleta
+Trazabilidad,Consultar por código/lote,Muestra historial completo
+Alertas,Registrar no cumple/rechazado/indicador no conforme,Genera alerta
+Tiempos,Registrar hora inicio/fin,Calcula duración
+Reporte,Exportar Excel,Descarga archivo
+Percepción,Aplicar encuesta,Muestra promedios
