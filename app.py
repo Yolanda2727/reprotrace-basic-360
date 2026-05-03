@@ -21,6 +21,220 @@ def _get_plt():
     import matplotlib.pyplot as _plt
     return _plt
 
+# ─── CSS Tecnológico ─────────────────────────────────────────────────────────
+TECH_CSS = """
+<style>
+/* ── Fuente y fondo ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Share+Tech+Mono&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+/* ── Fondo degradado oscuro ── */
+.stApp {
+    background: linear-gradient(135deg, #0a0e1a 0%, #0d1b35 50%, #0a1628 100%);
+    color: #e2e8f0;
+}
+
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #050d1f 0%, #0a1628 100%) !important;
+    border-right: 1px solid #1e3a5f;
+}
+section[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
+section[data-testid="stSidebar"] .stRadio label { color: #94a3b8 !important; font-size: 0.85rem; }
+section[data-testid="stSidebar"] .stRadio [data-testid="stMarkdownContainer"] p { color: #e2e8f0 !important; }
+
+/* ── Header custom ── */
+.rt-header {
+    background: linear-gradient(90deg, #0f3460 0%, #1a5276 50%, #154360 100%);
+    border-bottom: 2px solid #00d4ff;
+    padding: 1rem 1.5rem;
+    border-radius: 0 0 12px 12px;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 4px 24px rgba(0,212,255,0.15);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.rt-header-logo {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: #00d4ff;
+    text-shadow: 0 0 20px rgba(0,212,255,0.5);
+    letter-spacing: 1px;
+}
+.rt-header-sub {
+    font-size: 0.78rem;
+    color: #7fb3d3;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+.rt-header-badge {
+    margin-left: auto;
+    background: rgba(0,212,255,0.1);
+    border: 1px solid #00d4ff;
+    border-radius: 20px;
+    padding: 0.3rem 0.9rem;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem;
+    color: #00d4ff;
+}
+
+/* ── Métricas ── */
+[data-testid="metric-container"] {
+    background: linear-gradient(135deg, #0d1b35 0%, #0f2444 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 1rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05);
+    transition: box-shadow 0.2s;
+}
+[data-testid="metric-container"]:hover {
+    box-shadow: 0 4px 20px rgba(0,212,255,0.2);
+    border-color: #00d4ff;
+}
+[data-testid="metric-container"] [data-testid="stMetricLabel"] {
+    color: #7fb3d3 !important; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px;
+}
+[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: #00d4ff !important; font-family: 'Share Tech Mono', monospace; font-size: 1.8rem;
+}
+
+/* ── Botones ── */
+.stButton > button {
+    background: linear-gradient(135deg, #0f3460 0%, #1a5276 100%) !important;
+    color: #00d4ff !important;
+    border: 1px solid #00d4ff !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px !important;
+    transition: all 0.2s !important;
+    box-shadow: 0 0 10px rgba(0,212,255,0.1) !important;
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #1a5276 0%, #2980b9 100%) !important;
+    box-shadow: 0 0 20px rgba(0,212,255,0.3) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* ── Inputs ── */
+.stTextInput > div > div > input,
+.stSelectbox > div > div,
+.stTextArea textarea,
+.stNumberInput input,
+.stDateInput input {
+    background: #0d1b35 !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 8px !important;
+    color: #e2e8f0 !important;
+}
+.stTextInput > div > div > input:focus,
+.stTextArea textarea:focus {
+    border-color: #00d4ff !important;
+    box-shadow: 0 0 8px rgba(0,212,255,0.2) !important;
+}
+
+/* ── Tablas ── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1e3a5f;
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+/* ── Expanders ── */
+.streamlit-expanderHeader {
+    background: linear-gradient(90deg, #0d1b35, #0f2444) !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 8px !important;
+    color: #00d4ff !important;
+}
+
+/* ── Alertas ── */
+.stAlert {
+    border-radius: 10px !important;
+    border-left: 4px solid !important;
+}
+div[data-baseweb="notification"][kind="error"] {
+    background: rgba(185,28,28,0.15) !important;
+    border-left-color: #ef4444 !important;
+}
+div[data-baseweb="notification"][kind="warning"] {
+    background: rgba(180,83,9,0.15) !important;
+    border-left-color: #f59e0b !important;
+}
+div[data-baseweb="notification"][kind="success"] {
+    background: rgba(21,128,61,0.15) !important;
+    border-left-color: #22c55e !important;
+}
+div[data-baseweb="notification"][kind="info"] {
+    background: rgba(29,78,216,0.15) !important;
+    border-left-color: #3b82f6 !important;
+}
+
+/* ── Separadores ── */
+hr { border-color: #1e3a5f !important; }
+
+/* ── Títulos ── */
+h1, h2, h3 { color: #e2e8f0 !important; }
+h1 { border-bottom: 1px solid #1e3a5f; padding-bottom: .5rem; }
+
+/* ── Texto general ── */
+p, label, .stMarkdown { color: #cbd5e1 !important; }
+.stCaption { color: #64748b !important; }
+
+/* ── Card panel login ── */
+.login-card {
+    background: linear-gradient(135deg, #050d1f 0%, #0d1b35 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 16px;
+    padding: 2rem;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5), 0 0 40px rgba(0,212,255,0.05);
+    max-width: 700px;
+    margin: 0 auto;
+}
+.login-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 2.2rem;
+    color: #00d4ff;
+    text-shadow: 0 0 30px rgba(0,212,255,0.4);
+    text-align: center;
+    letter-spacing: 2px;
+}
+.login-sub {
+    text-align: center;
+    color: #7fb3d3;
+    font-size: 0.85rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 1.5rem;
+}
+.badge-acad {
+    display:inline-block;
+    background: rgba(0,212,255,0.08);
+    border: 1px solid #1e3a5f;
+    border-radius: 20px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.72rem;
+    color: #7fb3d3;
+    margin: 0.2rem;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0a0e1a; }
+::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #00d4ff; }
+
+/* ── Radio menu sidebar ── */
+.stRadio > div { gap: 0.2rem; }
+.stRadio label { padding: 0.4rem 0.8rem; border-radius: 6px; transition: background 0.15s; }
+.stRadio label:hover { background: rgba(0,212,255,0.08); }
+</style>
+"""
+
 # ─── Constantes ──────────────────────────────────────────────────────────────
 DB_PATH   = "reprotrace_basic_360.db"
 APP_NAME  = "ReproTrace Basic 360°"
@@ -436,10 +650,19 @@ def inst_footer():
 
 # ─── Pantalla de login ────────────────────────────────────────────────────────
 def login_screen():
-    st.title(APP_NAME)
-    st.subheader("Sistema académico de monitoreo y trazabilidad del instrumental quirúrgico")
+    st.markdown("""
+    <div class="login-card">
+        <div class="login-title">🏥 ReproTrace Basic 360°</div>
+        <div class="login-sub">Sistema de Trazabilidad de Instrumental Quirúrgico</div>
+        <div style="text-align:center;margin-bottom:1rem">
+            <span class="badge-acad">🎓 Universidad Libre Seccional Barranquilla</span>
+            <span class="badge-acad">⚗️ Instrumentación Quirúrgica</span>
+            <span class="badge-acad">🔬 Prototipo Académico v2.0</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("")
     st.warning(NOTA_ACAD)
-    st.markdown(inst_footer())
     with st.sidebar:
         st.title("Acceso al sistema")
         tab_login, tab_reg = st.tabs(["🔑 Ingresar", "📝 Registrarse"])
@@ -491,9 +714,24 @@ def login_screen():
                         st.error(msg)
 
 def header():
-    st.title(APP_NAME); st.caption(NOTA_ACAD)
-    st.sidebar.success(f"👤 {st.session_state['user']}  |  {st.session_state['role']}")
-    if st.sidebar.button("🚪 Cerrar sesión",use_container_width=True):
+    now_str = datetime.now().strftime("%Y-%m-%d  %H:%M")
+    st.markdown(f"""
+    <div class="rt-header">
+        <div>
+            <div class="rt-header-logo">🏥 {APP_NAME}</div>
+            <div class="rt-header-sub">Sistema de Trazabilidad · {VERSION}</div>
+        </div>
+        <div class="rt-header-badge">🕐 {now_str}</div>
+    </div>""", unsafe_allow_html=True)
+    # Sidebar usuario
+    st.sidebar.markdown(f"""
+    <div style="background:rgba(0,212,255,0.08);border:1px solid #1e3a5f;border-radius:10px;
+                padding:0.8rem;margin-bottom:0.8rem;text-align:center;">
+        <div style="font-size:1.5rem">👤</div>
+        <div style="font-weight:700;color:#00d4ff;font-size:0.9rem">{st.session_state['user']}</div>
+        <div style="font-size:0.72rem;color:#7fb3d3;text-transform:uppercase;letter-spacing:1px">{st.session_state['role']}</div>
+    </div>""", unsafe_allow_html=True)
+    if st.sidebar.button("🚪 Cerrar sesión", use_container_width=True):
         execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
                 (st.session_state["user"],st.session_state["role"],"Cierre de sesión",datetime.now().isoformat()))
         audit(st.session_state["user"],"Cierre de sesión","Login")
@@ -973,7 +1211,9 @@ def limitations_module():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide")
+    st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide",
+                       initial_sidebar_state="expanded")
+    st.markdown(TECH_CSS, unsafe_allow_html=True)
     init_db()
     if not st.session_state.get("seeded"):
         seed_demo_data(); st.session_state["seeded"] = True
