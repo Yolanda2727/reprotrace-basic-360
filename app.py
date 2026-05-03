@@ -45,7 +45,7 @@ def apply_login_background():
     """
     # ── RUTA DE LA IMAGEN DE FONDO ──────────────────────────────────────────
     # Para cambiar el fondo, modifica la ruta de abajo:
-    bg_path = "assets/imagen de fondo de pantalla.png"
+    bg_path = "assets/fondo_login.png"
     b64 = _img_to_base64(bg_path)
 
     if b64:
