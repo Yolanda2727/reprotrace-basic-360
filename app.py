@@ -344,26 +344,28 @@ def apply_login_background():
     ::-webkit-scrollbar-thumb {{ background: #1e3a5f; border-radius: 3px; }}
     ::-webkit-scrollbar-thumb:hover {{ background: #00d4ff; }}
 
-    /* ── Logo esquina superior derecha ── */
-    /* Para mover la posición cambia top/right. Para el tamaño cambia width en el HTML */
+    /* ── Logos en las 4 esquinas ── */
+    /* Para ajustar el tamaño cambia width en .corner-logo img */
     .corner-logo {{
         position: fixed;
-        top: 18px;
-        right: 22px;
         z-index: 9999;
-        opacity: 0.92;
+        opacity: 0.88;
         transition: opacity 0.25s, transform 0.25s;
     }}
     .corner-logo:hover {{
         opacity: 1;
-        transform: scale(1.06);
+        transform: scale(1.08);
     }}
     .corner-logo img {{
-        width: 80px;   /* Cambia este valor para ajustar el tamaño del logo de esquina */
+        width: 110px;   /* Cambia este valor para ajustar el tamaño de los logos de esquina */
         height: auto;
-        filter: drop-shadow(0 2px 12px rgba(0,212,255,0.5));
+        filter: drop-shadow(0 2px 14px rgba(0,212,255,0.55));
         border-radius: 10px;
     }}
+    .corner-tl {{ top: 16px;    left: 18px;  }}
+    .corner-tr {{ top: 16px;    right: 18px; }}
+    .corner-bl {{ bottom: 16px; left: 18px;  }}
+    .corner-br {{ bottom: 16px; right: 18px; }}
 
     /* ── Alertas dentro del login ── */
     .stAlert {{
@@ -377,8 +379,7 @@ def apply_login_background():
 
 def show_corner_logo() -> None:
     """
-    Muestra el logo 1833387-middle.png en la esquina superior derecha
-    de la pantalla de login, usando posición fija (CSS position: fixed).
+    Muestra el logo 1833387-middle.png en las 4 esquinas de la pantalla de login.
     - Para cambiar la imagen: reemplaza assets/1833387-middle.png.
     - Para ajustar tamaño: edita width en la clase .corner-logo img del CSS.
     - Si la imagen no existe, no muestra nada (sin errores).
@@ -388,10 +389,13 @@ def show_corner_logo() -> None:
     b64 = _img_to_base64(corner_path)
     if not b64:
         return  # Si no existe la imagen, no muestra nada
+    img_tag = f'<img src="data:image/png;base64,{b64}" alt="Logo institucional" />'
+    # Renderiza el logo en las 4 esquinas (top-left, top-right, bottom-left, bottom-right)
     st.markdown(f"""
-    <div class="corner-logo">
-        <img src="data:image/png;base64,{b64}" alt="Logo institucional" />
-    </div>
+    <div class="corner-logo corner-tl">{img_tag}</div>
+    <div class="corner-logo corner-tr">{img_tag}</div>
+    <div class="corner-logo corner-bl">{img_tag}</div>
+    <div class="corner-logo corner-br">{img_tag}</div>
     """, unsafe_allow_html=True)
 
 
