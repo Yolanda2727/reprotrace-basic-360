@@ -71,7 +71,24 @@ def apply_login_background():
     # - efecto hover en el botón
     st.markdown(f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Share+Tech+Mono&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&family=Share+Tech+Mono&family=Orbitron:wght@700;900&display=swap');
+
+    /* ── Animación de glow pulsante para el título ── */
+    @keyframes glowPulse {{
+        0%   {{ text-shadow: 0 0 10px #00d4ff, 0 0 25px rgba(0,212,255,0.5), 0 0 50px rgba(0,180,255,0.2); }}
+        50%  {{ text-shadow: 0 0 20px #00d4ff, 0 0 50px rgba(0,212,255,0.8), 0 0 90px rgba(0,180,255,0.4); }}
+        100% {{ text-shadow: 0 0 10px #00d4ff, 0 0 25px rgba(0,212,255,0.5), 0 0 50px rgba(0,180,255,0.2); }}
+    }}
+    /* ── Animación de scanline para el subtítulo ── */
+    @keyframes fadeSlideUp {{
+        from {{ opacity: 0; transform: translateY(8px); }}
+        to   {{ opacity: 1; transform: translateY(0); }}
+    }}
+    /* ── Parpadeo del cursor tecnológico ── */
+    @keyframes blink {{
+        0%, 100% {{ opacity: 1; }}
+        50%      {{ opacity: 0; }}
+    }}
 
     /* ── Ocultar elementos de Streamlit innecesarios en el login ── */
     #MainMenu, footer, header {{
@@ -151,54 +168,87 @@ def apply_login_background():
         border-radius: 12px;
     }}
 
-    /* ── Separador visual ── */
+    /* ── Separador visual luminoso ── */
     .login-divider {{
         border: none;
-        border-top: 1px solid rgba(0, 180, 220, 0.2);
-        margin: 0.8rem 0 1.2rem 0;
+        height: 1px;
+        background: linear-gradient(
+            90deg,
+            transparent 0%,
+            rgba(0, 212, 255, 0.15) 20%,
+            rgba(0, 212, 255, 0.6) 50%,
+            rgba(0, 212, 255, 0.15) 80%,
+            transparent 100%
+        );
+        margin: 1rem 0 1.4rem 0;
+        box-shadow: 0 0 8px rgba(0,212,255,0.3);
     }}
 
     /* ── Título principal ── */
+    /* Fuente Orbitron: tipografía sci-fi tecnológica */
     .login-title {{
-        font-family: 'Share Tech Mono', monospace;
-        font-size: 2rem;
-        color: #00d4ff;
-        text-shadow: 0 0 30px rgba(0,212,255,0.5);
+        font-family: 'Orbitron', 'Share Tech Mono', monospace;
+        font-size: 2.15rem;
+        font-weight: 900;
+        color: #00e5ff;
+        animation: glowPulse 3s ease-in-out infinite;
         text-align: center;
-        letter-spacing: 2px;
-        margin-bottom: 0.2rem;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+        margin-bottom: 0.4rem;
+        line-height: 1.2;
+    }}
+    /* Cursor parpadeante al final del título */
+    .login-title::after {{
+        content: '_';
+        animation: blink 1.1s step-end infinite;
+        color: #00d4ff;
+        font-size: 1.8rem;
     }}
 
     /* ── Subtítulo institucional ── */
     .login-sub {{
         text-align: center;
-        color: #7fb3d3;
-        font-size: 0.8rem;
-        letter-spacing: 1.5px;
+        color: #a8d8ea;
+        font-size: 0.86rem;
+        font-weight: 600;
+        letter-spacing: 2px;
         text-transform: uppercase;
-        margin-bottom: 0.3rem;
-        line-height: 1.5;
+        margin-bottom: 0.4rem;
+        line-height: 1.7;
+        animation: fadeSlideUp 0.8s ease both;
+        text-shadow: 0 0 12px rgba(168,216,234,0.3);
     }}
 
     /* ── Lema de valor ── */
     .login-tagline {{
         text-align: center;
-        color: rgba(0, 212, 255, 0.75);
-        font-size: 0.78rem;
-        font-style: italic;
+        color: #00d4ff;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.82rem;
+        font-weight: 400;
+        letter-spacing: 1px;
         margin-bottom: 1rem;
+        padding: 0.45rem 1rem;
+        background: rgba(0,212,255,0.06);
+        border: 1px solid rgba(0,212,255,0.18);
+        border-radius: 6px;
+        animation: fadeSlideUp 1s ease both;
     }}
 
     /* ── Badges académicos ── */
     .badge-acad {{
         display: inline-block;
-        background: rgba(0, 212, 255, 0.08);
-        border: 1px solid rgba(0, 212, 255, 0.25);
+        background: rgba(0, 212, 255, 0.1);
+        border: 1px solid rgba(0, 212, 255, 0.35);
         border-radius: 20px;
-        padding: 0.2rem 0.7rem;
-        font-size: 0.7rem;
-        color: #7fb3d3;
+        padding: 0.25rem 0.8rem;
+        font-size: 0.72rem;
+        font-weight: 600;
+        color: #a8d8ea;
         margin: 0.15rem;
+        letter-spacing: 0.5px;
+        text-shadow: 0 0 6px rgba(0,212,255,0.3);
     }}
 
     /* ── Inputs dentro del login ── */
@@ -278,10 +328,14 @@ def apply_login_background():
     /* ── Bienvenida superior ── */
     .login-welcome {{
         text-align: center;
-        color: rgba(200, 220, 240, 0.7);
-        font-size: 0.82rem;
+        color: rgba(180, 220, 255, 0.9);
+        font-size: 0.92rem;
+        font-weight: 600;
         margin-bottom: 1.5rem;
-        letter-spacing: 0.5px;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        text-shadow: 0 0 15px rgba(0,180,255,0.35);
+        animation: fadeSlideUp 0.6s ease both;
     }}
 
     /* ── Scrollbar ── */
