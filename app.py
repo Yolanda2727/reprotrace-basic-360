@@ -1058,14 +1058,26 @@ def generate_pdf():
     now=datetime.now().strftime("%Y-%m-%d %H:%M")
 
     class PDF(FPDF):
+        def normalize_text(self, txt):
+            # Transliterate common non-Latin-1 chars so core fonts don't crash
+            txt = (str(txt)
+                .replace("\u2013", "-")    # en dash
+                .replace("\u2014", "--")   # em dash
+                .replace("\u2018", "'")    # left single quote
+                .replace("\u2019", "'")    # right single quote
+                .replace("\u201c", '"')    # left double quote
+                .replace("\u201d", '"')    # right double quote
+                .replace("\u2026", "...")  # ellipsis
+                .replace("\u00b0", "\u00b0"))  # degree sign – keep as-is (latin-1 0xB0)
+            return super().normalize_text(txt)
         def header(self):
             self.set_font("Helvetica","B",10)
-            self.cell(0,8,f"{APP_NAME} – Informe de Trazabilidad",**_NL,align="C")
+            self.cell(0,8,f"{APP_NAME} - Informe de Trazabilidad",**_NL,align="C")
             self.set_draw_color(30,80,130); self.set_line_width(0.5)
             self.line(10,self.get_y(),200,self.get_y()); self.ln(3)
         def footer(self):
             self.set_y(-15); self.set_font("Helvetica","I",8)
-            self.cell(0,8,f"Generado: {now}  –  Pág. {self.page_no()}",align="C")
+            self.cell(0,8,f"Generado: {now}  -  Pag. {self.page_no()}",align="C")
         def titulo(self,t):
             self.set_font("Helvetica","B",12)
             self.set_fill_color(31,78,121); self.set_text_color(255,255,255)
@@ -1101,7 +1113,7 @@ def generate_pdf():
     pdf.ln(4); pdf.set_font("Helvetica","",10)
     for line in ["Universidad Libre Seccional Barranquilla",
                  "Programa de Instrumentación Quirúrgica",
-                 f"Barranquilla – Colombia  |  {now}",
+                 f"Barranquilla - Colombia  |  {now}",
                  "Autor: Anderson Diaz Perez",
                  "Apoyo: Ligia Elena Cabana Cabana  ·  Cesar Augusto Vásquez Hurtado"]:
         pdf.cell(0,7,line,**_NL,align="C")
