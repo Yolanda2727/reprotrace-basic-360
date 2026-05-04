@@ -60,8 +60,27 @@ pandas==2.2.2
 xlsxwriter==3.2.0
 matplotlib>=3.8.0
 fpdf2>=2.7.9
+openai>=1.30.0
+pypdf>=4.2.0
+python-docx>=1.1.2
 ```
 `streamlit` es gestionado por Streamlit Cloud y **no se incluye** en `requirements.txt`.
+
+---
+
+## Trace 🤖 — Adjuntar y analizar documentos
+Dentro del módulo **Plan de mejora** → expander **🤖 Trace – Asistente IA de Reprocesamiento**, hay una pestaña **📎 Documentos** que permite:
+- Adjuntar uno o varios archivos **PDF/DOCX/TXT/MD/CSV**.
+- Extraer texto y enviarlo como contexto a Trace para análisis (resumen, hallazgos, recomendaciones, etc.).
+
+> **Privacidad:** al analizar, el contenido del documento se envía a OpenAI. Evite información sensible.
+
+### Configurar la API Key
+- En Streamlit Cloud: Settings → Secrets → añadir `OPENAI_API_KEY`.
+- En local: crear `.streamlit/secrets.toml` con:
+	```toml
+	OPENAI_API_KEY = "tu_clave"
+	```
 
 ---
 

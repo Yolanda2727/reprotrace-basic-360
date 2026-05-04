@@ -1776,6 +1776,118 @@ def _extract_open_alert_findings(severity: str = "Todas", limit: int = 20) -> li
         findings.append(f"Alerta abierta: [{sev}] {at} – {code} / {batch}: {desc}")
     return findings
 
+
+def _decode_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return ""
+
+
+def _extract_text_from_uploaded(uploaded) -> tuple[str, str]:
+    """Devuelve (texto, error). Soporta PDF/DOCX/TXT/MD/CSV."""
+    if uploaded is None:
+        return "", "Archivo vacío."
+
+    name = getattr(uploaded, "name", "") or "archivo"
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+    try:
+        data = uploaded.getvalue()
+    except Exception:
+        try:
+            data = uploaded.read()
+        except Exception:
+            data = b""
+
+    if not data:
+        return "", "No se pudo leer el archivo."
+
+    if ext in ("txt", "md"):
+        return _decode_bytes(data), ""
+
+    if ext == "csv":
+        try:
+            df = pd.read_csv(io.BytesIO(data))
+            # Limitar tamaño para evitar prompts gigantes
+            preview = df.head(200)
+            return preview.to_csv(index=False), ""
+        except Exception as e:
+            return "", f"No pude leer el CSV: {e}"
+
+    if ext == "pdf":
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(data))
+            parts = []
+            for i, page in enumerate(reader.pages):
+                try:
+                    txt = page.extract_text() or ""
+                except Exception:
+                    txt = ""
+                if txt.strip():
+                    parts.append(txt)
+                # corte defensivo
+                if sum(len(p) for p in parts) > 200_000:
+                    parts.append("\n[...texto truncado por tamaño...]")
+                    break
+            out = "\n\n".join(parts).strip()
+            return out, "" if out else "No se extrajo texto del PDF (puede ser escaneado)."
+        except Exception as e:
+            return "", f"No pude procesar el PDF: {e}"
+
+    if ext == "docx":
+        try:
+            from docx import Document
+
+            doc = Document(io.BytesIO(data))
+            parts = []
+            for p in doc.paragraphs:
+                if p.text and p.text.strip():
+                    parts.append(p.text.strip())
+            for t in getattr(doc, "tables", []) or []:
+                for row in t.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            out = "\n".join(parts).strip()
+            return out, "" if out else "No se extrajo texto del DOCX."
+        except Exception as e:
+            return "", f"No pude procesar el DOCX: {e}"
+
+    return "", "Tipo de archivo no soportado. Usa PDF, DOCX, TXT, MD o CSV."
+
+
+def _build_docs_context(docs: list[dict], max_chars_total: int = 12000, max_chars_each: int = 4000) -> str:
+    """Construye un contexto compacto con límites de tamaño para enviarlo a Trace."""
+    if not docs:
+        return ""
+    blocks: list[str] = []
+    used = 0
+    for d in docs:
+        name = str(d.get("name", "documento")).strip()
+        text = str(d.get("text", ""))
+        if not text.strip():
+            continue
+        trimmed = text.strip()
+        if len(trimmed) > max_chars_each:
+            trimmed = trimmed[:max_chars_each] + "\n[...contenido truncado...]"
+        block = f"### {name}\n{trimmed}"
+        if used + len(block) > max_chars_total:
+            remain = max_chars_total - used
+            if remain < 200:
+                break
+            blocks.append(block[:remain] + "\n[...contexto truncado...]")
+            break
+        blocks.append(block)
+        used += len(block)
+    return "\n\n".join(blocks).strip()
+
 # ─── Plan de mejora ───────────────────────────────────────────────────────────
 def improvement_module():
     st.header("5. Plan de mejora")
@@ -1798,7 +1910,7 @@ def improvement_module():
                 "sobre normas (ISO 17664, AAMI ST79, INVIMA), etapas del proceso, "
                 "esterilización y gestión de calidad."
             )
-            tab_suggest, tab_bulk, tab_chat = st.tabs(["📋 Analizar hallazgo", "📑 Plan desde hallazgos", "💬 Chat con Trace"])
+            tab_suggest, tab_bulk, tab_docs, tab_chat = st.tabs(["📋 Analizar hallazgo", "📑 Plan desde hallazgos", "📎 Documentos", "💬 Chat con Trace"])
 
             # ── Tab 1: análisis estructurado ──
             with tab_suggest:
@@ -2017,6 +2129,105 @@ def improvement_module():
                                 )
                                 st.success(f"Planes guardados: {saved}. Omitidos (duplicados/vacíos): {skipped}.")
                                 st.rerun()
+
+            with tab_docs:
+                st.markdown(
+                    "Adjunta documentos (PDF/DOCX/TXT/MD/CSV) para que **Trace** los lea y los analice. "
+                    "⚠️ El contenido se enviará a OpenAI al analizar, así que evita datos sensibles."
+                )
+
+                uploaded_docs = st.file_uploader(
+                    "Adjuntar documentos",
+                    type=["pdf", "docx", "txt", "md", "csv"],
+                    accept_multiple_files=True,
+                    key="trace_docs_uploader",
+                )
+
+                colu1, colu2 = st.columns([1, 1])
+                with colu1:
+                    if st.button("📥 Procesar adjuntos", key="trace_docs_process"):
+                        docs_store: list[dict] = []
+                        for up in uploaded_docs or []:
+                            try:
+                                size = len(up.getvalue())
+                            except Exception:
+                                size = 0
+                            if size > 10 * 1024 * 1024:
+                                docs_store.append(
+                                    {
+                                        "name": getattr(up, "name", "archivo"),
+                                        "text": "",
+                                        "error": "Archivo demasiado grande (>10MB).",
+                                    }
+                                )
+                                continue
+
+                            txt, err = _extract_text_from_uploaded(up)
+                            docs_store.append(
+                                {
+                                    "name": getattr(up, "name", "archivo"),
+                                    "text": txt,
+                                    "error": err,
+                                    "chars": len(txt or ""),
+                                }
+                            )
+                        st.session_state["_trace_docs"] = docs_store
+
+                with colu2:
+                    if st.button("🗑️ Limpiar adjuntos", key="trace_docs_clear"):
+                        st.session_state.pop("_trace_docs", None)
+                        st.rerun()
+
+                docs = st.session_state.get("_trace_docs", [])
+                if docs:
+                    ok = sum(1 for d in docs if d.get("text"))
+                    bad = sum(1 for d in docs if d.get("error") and not d.get("text"))
+                    st.caption(f"Adjuntos procesados: {len(docs)} | con texto: {ok} | con error: {bad}")
+
+                    for d in docs:
+                        nm = d.get("name", "documento")
+                        err = d.get("error", "")
+                        ch = d.get("chars", 0)
+                        if err and not d.get("text"):
+                            st.warning(f"{nm}: {err}")
+                        else:
+                            st.success(f"{nm}: {ch} caracteres extraídos")
+
+                    with st.expander("Vista previa (solo lectura)", expanded=False):
+                        ctx = _build_docs_context(docs, max_chars_total=8000, max_chars_each=2500)
+                        st.text_area("", ctx or "(sin texto)", height=220, disabled=True)
+
+                doc_task = st.text_area(
+                    "¿Qué necesitas que Trace haga con estos documentos?",
+                    key="trace_docs_question",
+                    height=120,
+                    placeholder="Ej: Extrae hallazgos de no conformidad y sugiere acciones correctivas/preventivas.",
+                )
+
+                if st.button("🧠 Analizar documentos con Trace", key="trace_docs_analyze"):
+                    docs = st.session_state.get("_trace_docs", [])
+                    ctx = _build_docs_context(docs)
+                    if not ctx:
+                        st.warning("Primero adjunta y procesa documentos con texto extraíble.")
+                    elif not doc_task.strip():
+                        st.warning("Escribe una instrucción/pregunta para analizar.")
+                    else:
+                        with st.spinner("Trace está analizando los documentos…"):
+                            try:
+                                prompt = (
+                                    "Analiza el contenido de los documentos adjuntos y responde a la solicitud. "
+                                    "Si el documento contiene pasos/etapas, identifica desviaciones y recomendaciones.\n\n"
+                                    "DOCUMENTOS (solo lectura):\n" + ctx + "\n\n"
+                                    "SOLICITUD:\n" + doc_task.strip()
+                                )
+                                reply = _trace_chat([{"role": "user", "content": prompt}], ai_key)
+                                st.session_state["_trace_docs_reply"] = reply
+                            except Exception as e:
+                                st.session_state["_trace_docs_reply"] = f"Error al consultar Trace: {e}"
+
+                if st.session_state.get("_trace_docs_reply"):
+                    st.subheader("Respuesta de Trace")
+                    st.write(st.session_state["_trace_docs_reply"])
 
             with tab_chat:
                 if "_trace_history" not in st.session_state:
