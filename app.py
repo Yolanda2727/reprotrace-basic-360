@@ -1500,25 +1500,86 @@ def alerts_module():
             st.success("Alerta cerrada."); st.rerun()
 
 # ─── Asistente IA – Plan de mejora ───────────────────────────────────────────
-def _ai_suggest_improvement(finding: str, api_key: str) -> dict:
-    """Llama a OpenAI GPT y devuelve sugerencias para el plan de mejora."""
+# ─── Prompt base de Trace ────────────────────────────────────────────────────
+_TRACE_SYSTEM = """
+Eres Trace, asistente de inteligencia artificial especializado en centrales de
+reprocesamiento de instrumental quirurgico (CEYE / CRE). Fuiste creado para apoyar
+al equipo de ReproTrace Basic 360 de la Universidad Libre Seccional Barranquilla,
+Programa de Instrumentacion Quirurgica.
+
+Conocimiento de dominio:
+- Las 8 etapas del reprocesamiento: Recepcion, Limpieza y descontaminacion,
+  Inspeccion funcional, Empaque, Esterilizacion, Validacion y liberacion de carga,
+  Almacenamiento, Distribucion.
+- Clasificacion de Spaulding: critico, semicritico, no critico.
+- Normas y guias aplicables: ISO 17664, AAMI ST79, ISO 11135, ISO 11138, OPS/OMS
+  guias de reprocesamiento 2016, normativa INVIMA Colombia, Resolucion 4816/2008 del
+  Ministerio de Salud de Colombia sobre tecnovigilancia.
+- Metodos de esterilizacion: vapor saturado a presion (autoclave), oxido de etileno
+  (ETO), plasma de peroxido de hidrogeno (VH2O2), formaldehido.
+- Indicadores biologicos, quimicos y fisicos de proceso.
+- Parametros criticos de los ciclos: temperatura, presion, tiempo de exposicion,
+  parametros de secado.
+- Causas comunes de no conformidad: carga excesiva, mal empaque, humedad residual,
+  fallos de sellado, uso de detergentes incompatibles, omision de etapas.
+- Gestion de calidad: PHVA (Planificar-Hacer-Verificar-Actuar), analisis causa raiz,
+  5 porques, diagrama de Ishikawa.
+- Roles: tecnico en instrumentacion, enfermero jefe, supervisor de central, auditoria.
+
+Ejemplos de analisis estructurado:
+
+Hallazgo: "Se encontro instrumental con manchas de oxido despues del ciclo de
+           esterilizacion en autoclave."
+Respuesta JSON:
+{
+  "causa_probable": "Humedad residual post-esterilizacion por fallo en fase de secado
+    o carga excesiva que impide circulacion del vapor; posible uso de agua no
+    desmineralizada en el autoclave.",
+  "accion_correctiva": "Revisar y calibrar ciclo de secado del autoclave. Reducir
+    densidad de carga. Verificar calidad del agua de alimentacion (conductividad < 5
+    uS/cm segun EN 285). Retirar y limpiar instrumental afectado.",
+  "accion_preventiva": "Establecer protocolo de verificacion diaria del secado
+    (prueba de humedad en empaque). Capacitar al personal en criterios de carga.
+    Registrar parametros de cada ciclo como evidencia.",
+  "nivel_riesgo": "Alto"
+}
+
+Hallazgo: "Falta un instrumento en la caja de cirugia entregada a quirofano."
+Respuesta JSON:
+{
+  "causa_probable": "Error en conteo de instrumental en etapa de inspeccion funcional
+    o empaque; posible extravío durante la distribucion.",
+  "accion_correctiva": "Realizar conteo de verificacion en central antes de la
+    siguiente entrega. Localizar el instrumento faltante. Notificar al quirofano y
+    registrar la no conformidad en el modulo de alertas.",
+  "accion_preventiva": "Implementar lista de verificacion de conteo por caja (check
+    list con imagen). Capacitar al personal en el doble conteo. Usar etiquetas con
+    contenido esperado por caja.",
+  "nivel_riesgo": "Critico"
+}
+
+Reglas de respuesta:
+- Cuando el usuario solicite analisis de un hallazgo, responde SOLO con un objeto
+  JSON valido con las claves: causa_probable, accion_correctiva, accion_preventiva,
+  nivel_riesgo (valores: Bajo, Medio, Alto, Critico).
+- Para preguntas de chat (no hallazgos), responde en texto claro, profesional y en
+  espanol, sin JSON. Puedes usar listas con guiones.
+- Nunca inventes normativas que no existan. Si no tienes seguridad, indícalo.
+- Dirígete al usuario con respeto y en contexto academico colombiano.
+"""
+
+def _trace_suggest(finding: str, api_key: str) -> dict:
+    """Llama a Trace (GPT) y devuelve sugerencias estructuradas en JSON."""
     import openai, json
     client = openai.OpenAI(api_key=api_key)
-    system = (
-        "Eres un experto en centrales de reprocesamiento de instrumental quirurgico. "
-        "Dado un hallazgo de no conformidad, responde SOLO con un objeto JSON con "
-        "exactamente estas claves: causa_probable, accion_correctiva, accion_preventiva, nivel_riesgo. "
-        "nivel_riesgo debe ser uno de: Bajo, Medio, Alto, Critico. "
-        "No incluyas texto adicional fuera del JSON."
-    )
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Hallazgo: {finding}"},
+            {"role": "system", "content": _TRACE_SYSTEM},
+            {"role": "user", "content": f"Analiza el siguiente hallazgo y devuelve el JSON:\n{finding}"},
         ],
-        temperature=0.3,
-        max_tokens=600,
+        temperature=0.2,
+        max_tokens=800,
     )
     raw = resp.choices[0].message.content.strip()
     try:
@@ -1527,15 +1588,27 @@ def _ai_suggest_improvement(finding: str, api_key: str) -> dict:
     except Exception:
         return {"raw": raw}
 
+def _trace_chat(messages: list, api_key: str) -> str:
+    """Envia el historial de chat a Trace y devuelve la respuesta en texto."""
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "system", "content": _TRACE_SYSTEM}] + messages,
+        temperature=0.5,
+        max_tokens=900,
+    )
+    return resp.choices[0].message.content.strip()
+
 # ─── Plan de mejora ───────────────────────────────────────────────────────────
 def improvement_module():
     st.header("5. Plan de mejora")
     st.info("💡 El sistema genera recomendaciones automáticas ante alertas críticas. También puede registrar hallazgos manualmente.")
     check_and_recommend()
 
-    # ── Asistente IA ──────────────────────────────────────────────────────────
-    with st.expander("🤖 Asistente IA – Sugerencias de план de mejora", expanded=False):
-        ai_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    # ── Asistente Trace ────────────────────────────────────────────────────────
+    ai_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    with st.expander("🤖 Trace – Asistente IA de Reprocesamiento", expanded=False):
         if not ai_key:
             st.warning(
                 "⚠️ Clave de OpenAI no configurada. "
@@ -1543,43 +1616,85 @@ def improvement_module():
                 "(Settings → Secrets) o en `.streamlit/secrets.toml` localmente."
             )
         else:
-            st.write(
-                "Describe el hallazgo y el asistente sugerirá **causa probable**, "
-                "**acción correctiva**, **acción preventiva** y **nivel de riesgo**."
+            st.markdown(
+                "> **Trace** es tu asistente especializado en centrales de reprocesamiento. "
+                "Puede analizar hallazgos y generar planes de mejora, o responder preguntas "
+                "sobre normas (ISO 17664, AAMI ST79, INVIMA), etapas del proceso, "
+                "esterilización y gestión de calidad."
             )
-            ai_finding = st.text_area(
-                "Hallazgo a analizar",
-                key="ai_finding_input",
-                height=90,
-                placeholder="Ej: Se detectó instrumental con residuos orgánicos tras el ciclo de limpieza.",
-            )
-            if st.button("✨ Sugerir con IA", key="ai_suggest_btn"):
-                if ai_finding.strip():
-                    with st.spinner("Consultando GPT…"):
-                        try:
-                            result = _ai_suggest_improvement(ai_finding.strip(), ai_key)
-                            st.session_state["_ai_sugg"] = result
-                        except Exception as e:
-                            st.error(f"Error al consultar la IA: {e}")
-                            st.session_state.pop("_ai_sugg", None)
-                else:
-                    st.warning("Ingresa el hallazgo antes de consultar.")
+            tab_suggest, tab_chat = st.tabs(["📋 Analizar hallazgo", "💬 Chat con Trace"])
 
-            sugg = st.session_state.get("_ai_sugg")
-            if sugg:
-                if "raw" in sugg:
-                    st.text_area("Respuesta del asistente", sugg["raw"], height=160, disabled=True)
-                else:
-                    colA, colB = st.columns(2)
-                    colA.info(f"**Causa probable**\n\n{sugg.get('causa_probable', '')}")
-                    colB.warning(f"**Acción correctiva**\n\n{sugg.get('accion_correctiva', '')}")
-                    st.success(f"**Acción preventiva**\n\n{sugg.get('accion_preventiva', '')}")
-                    nivel = sugg.get("nivel_riesgo", sugg.get("nivel_riesgo", ""))
-                    st.caption(f"Nivel de riesgo sugerido: **{nivel}**")
-                    st.info(
-                        "Usa estas sugerencias para rellenar el formulario de registro a continuación.",
-                        icon="👇",
-                    )
+            # ── Tab 1: análisis estructurado ──
+            with tab_suggest:
+                ai_finding = st.text_area(
+                    "Describe el hallazgo de no conformidad",
+                    key="ai_finding_input",
+                    height=100,
+                    placeholder="Ej: Se detectó instrumental con residuos orgánicos tras el ciclo de limpieza en la etapa de inspección funcional.",
+                )
+                if st.button("✨ Analizar con Trace", key="ai_suggest_btn"):
+                    if ai_finding.strip():
+                        with st.spinner("Trace está analizando el hallazgo…"):
+                            try:
+                                result = _trace_suggest(ai_finding.strip(), ai_key)
+                                st.session_state["_ai_sugg"] = result
+                            except Exception as e:
+                                st.error(f"Error al consultar Trace: {e}")
+                                st.session_state.pop("_ai_sugg", None)
+                    else:
+                        st.warning("Ingresa el hallazgo antes de consultar.")
+
+                sugg = st.session_state.get("_ai_sugg")
+                if sugg:
+                    if "raw" in sugg:
+                        st.text_area("Respuesta de Trace", sugg["raw"], height=180, disabled=True)
+                    else:
+                        nivel = sugg.get("nivel_riesgo", "")
+                        color_map = {"Bajo": "#2ecc71", "Medio": "#f39c12", "Alto": "#e67e22", "Critico": "#e74c3c"}
+                        badge_color = color_map.get(nivel, "#95a5a6")
+                        st.markdown(
+                            f"<span style='background:{badge_color};color:#fff;padding:3px 12px;"
+                            f"border-radius:12px;font-weight:bold;'>Nivel de riesgo: {nivel}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown("")
+                        colA, colB = st.columns(2)
+                        colA.info(f"**🔍 Causa probable**\n\n{sugg.get('causa_probable', '')}")
+                        colB.warning(f"**🔧 Acción correctiva**\n\n{sugg.get('accion_correctiva', '')}")
+                        st.success(f"**🛡️ Acción preventiva**\n\n{sugg.get('accion_preventiva', '')}")
+                        st.info("Usa estas sugerencias para completar el formulario ➕ Registrar nuevo plan.", icon="👇")
+
+            # ── Tab 2: chat conversacional ──
+            with tab_chat:
+                if "_trace_history" not in st.session_state:
+                    st.session_state["_trace_history"] = []
+
+                for msg in st.session_state["_trace_history"]:
+                    role_label = "🧑 Tú" if msg["role"] == "user" else "🤖 Trace"
+                    with st.chat_message(msg["role"]):
+                        st.write(f"{msg['content']}")
+
+                user_input = st.chat_input(
+                    "Pregunta a Trace sobre reprocesamiento, normas o mejora continua…",
+                    key="trace_chat_input",
+                )
+                if user_input:
+                    st.session_state["_trace_history"].append({"role": "user", "content": user_input})
+                    with st.chat_message("user"):
+                        st.write(user_input)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Trace está pensando…"):
+                            try:
+                                reply = _trace_chat(st.session_state["_trace_history"], ai_key)
+                            except Exception as e:
+                                reply = f"Error al consultar Trace: {e}"
+                        st.write(reply)
+                    st.session_state["_trace_history"].append({"role": "assistant", "content": reply})
+
+                if st.session_state.get("_trace_history"):
+                    if st.button("🗑️ Limpiar conversación", key="trace_clear"):
+                        st.session_state["_trace_history"] = []
+                        st.rerun()
     # ─────────────────────────────────────────────────────────────────────────
     with st.expander("➕ Registrar nuevo plan",expanded=False):
         with st.form("imp_form"):
