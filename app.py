@@ -1600,6 +1600,182 @@ def _trace_chat(messages: list, api_key: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+
+_TRACE_PLAN_SYSTEM = """
+Eres Trace, asistente de IA especializado en centrales de reprocesamiento (CEYE/CRE).
+
+Tarea:
+- A partir de una lista de hallazgos/no conformidades, genera un PLAN DE MEJORA (PHVA)
+  con acciones correctivas y preventivas, e incluye cuando aplique: capacitacion,
+  recursos necesarios, indicador/KPI y verificacion.
+
+Reglas de respuesta:
+- Responde SOLO con JSON valido (sin texto adicional, sin markdown).
+- Devuelve un objeto con la clave "planes" que contiene una lista.
+- Cada elemento de "planes" debe incluir estas claves:
+  hallazgo, tipo_riesgo, nivel_riesgo, causa_probable, accion_correctiva,
+  accion_preventiva, capacitacion, recursos, indicador_kpi, responsable_rol,
+  plazo_dias, verificacion.
+- "nivel_riesgo" debe ser exactamente uno de: Bajo, Medio, Alto, Crítico.
+- "plazo_dias" debe ser un entero (p. ej., 7, 15, 30).
+- No inventes normativas. Si no estas seguro, di "No especificado".
+""".strip()
+
+
+def _normalize_risk_level(level: str) -> str:
+    if not level:
+        return "Medio"
+    lvl = str(level).strip()
+    mapping = {
+        "bajo": "Bajo",
+        "medio": "Medio",
+        "alto": "Alto",
+        "critico": "Crítico",
+        "crítico": "Crítico",
+        "alta": "Alto",
+        "media": "Medio",
+        "baja": "Bajo",
+    }
+    return mapping.get(lvl.lower(), "Medio")
+
+
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        try:
+            with open(path, "r", encoding="latin-1") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+
+def _extract_audit_findings(md_text: str) -> list[str]:
+    """Extrae hallazgos desde secciones típicas del archivo de auditoría."""
+    if not md_text:
+        return []
+
+    import re
+
+    targets = {
+        "hallazgos críticos corregidos": "Hallazgo",
+        "limitaciones que permanecen": "Limitación",
+    }
+
+    findings: list[str] = []
+    current_prefix: str | None = None
+
+    for raw in md_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith("## "):
+            title = line.removeprefix("## ").strip().lower()
+            current_prefix = None
+            for key, prefix in targets.items():
+                if title.startswith(key):
+                    current_prefix = prefix
+                    break
+            continue
+
+        if current_prefix is None:
+            continue
+
+        # Numeradas: "1. ..." o bullets: "- ..."
+        item = None
+        m_num = re.match(r"^\d+\.\s+(.*)$", line)
+        if m_num:
+            item = m_num.group(1).strip()
+        else:
+            m_bul = re.match(r"^-\s+(.*)$", line)
+            if m_bul:
+                item = m_bul.group(1).strip()
+
+        if item:
+            findings.append(f"{current_prefix}: {item}")
+    return findings
+
+
+def _trace_generate_plan(findings: list[str], api_key: str) -> dict:
+    """Genera un plan de mejora (lista) a partir de múltiples hallazgos."""
+    import openai, json
+
+    content = "\n".join([f"- {f}" for f in findings if str(f).strip()])
+    client = openai.OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": _TRACE_PLAN_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    "Genera el plan de mejora a partir de estos hallazgos:\n" + content
+                ),
+            },
+        ],
+        temperature=0.25,
+        max_tokens=1400,
+    )
+    raw = resp.choices[0].message.content.strip()
+    try:
+        clean = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(clean)
+    except Exception:
+        return {"raw": raw}
+
+
+def _format_plan_evidence(item: dict, source: str) -> str:
+    cap = item.get("capacitacion", "")
+    rec = item.get("recursos", "")
+    kpi = item.get("indicador_kpi", "")
+    ver = item.get("verificacion", "")
+    resp = item.get("responsable_rol", "")
+    parts = [
+        f"Fuente: {source}",
+        f"Capacitación: {cap or 'No especificado'}",
+        f"Recursos: {rec or 'No especificado'}",
+        f"Indicador/KPI: {kpi or 'No especificado'}",
+        f"Verificación: {ver or 'No especificado'}",
+        f"Responsable (rol): {resp or 'No especificado'}",
+    ]
+    return "\n".join(parts)
+
+
+def _extract_open_alert_findings(severity: str = "Todas", limit: int = 20) -> list[str]:
+    """Convierte alertas abiertas en una lista de hallazgos para el plan de mejora."""
+    lim = max(1, min(int(limit or 20), 50))
+    if severity and severity != "Todas":
+        df = query_df(
+            """SELECT severity, alert_type, instrument_code, batch_code, description, created_at
+               FROM alerts
+               WHERE status='Abierta' AND severity=?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (severity, lim),
+        )
+    else:
+        df = query_df(
+            """SELECT severity, alert_type, instrument_code, batch_code, description, created_at
+               FROM alerts
+               WHERE status='Abierta'
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (lim,),
+        )
+    findings: list[str] = []
+    if df.empty:
+        return findings
+    for _, r in df.iterrows():
+        sev = str(r.get("severity", "")).strip()
+        at = str(r.get("alert_type", "")).strip()
+        code = str(r.get("instrument_code", "")).strip()
+        batch = str(r.get("batch_code", "")).strip()
+        desc = str(r.get("description", "")).strip()
+        findings.append(f"Alerta abierta: [{sev}] {at} – {code} / {batch}: {desc}")
+    return findings
+
 # ─── Plan de mejora ───────────────────────────────────────────────────────────
 def improvement_module():
     st.header("5. Plan de mejora")
@@ -1622,7 +1798,7 @@ def improvement_module():
                 "sobre normas (ISO 17664, AAMI ST79, INVIMA), etapas del proceso, "
                 "esterilización y gestión de calidad."
             )
-            tab_suggest, tab_chat = st.tabs(["📋 Analizar hallazgo", "💬 Chat con Trace"])
+            tab_suggest, tab_bulk, tab_chat = st.tabs(["📋 Analizar hallazgo", "📑 Plan desde hallazgos", "💬 Chat con Trace"])
 
             # ── Tab 1: análisis estructurado ──
             with tab_suggest:
@@ -1665,6 +1841,183 @@ def improvement_module():
                         st.info("Usa estas sugerencias para completar el formulario ➕ Registrar nuevo plan.", icon="👇")
 
             # ── Tab 2: chat conversacional ──
+            with tab_bulk:
+                st.markdown(
+                    "Genera un plan de mejora a partir de varios hallazgos (por ejemplo, "
+                    "los de una auditoría). Puedes previsualizarlo y guardarlo en el módulo."
+                )
+
+                src = st.radio(
+                    "Fuente de hallazgos",
+                    [
+                        "📄 Leer AUDITORIA_PROFUNDA.md",
+                        "🔔 Usar alertas abiertas",
+                        "📄 + 🔔 Auditoría + alertas abiertas",
+                        "✍️ Pegar hallazgos",
+                    ],
+                    horizontal=True,
+                )
+
+                findings: list[str] = []
+                source_label = ""
+                preview_lines: list[str] = []
+
+                if src.startswith("📄 +"):
+                    source_label = "AUDITORIA_PROFUNDA.md + Alertas abiertas"
+
+                    md = _read_text_file("AUDITORIA_PROFUNDA.md")
+                    extracted = _extract_audit_findings(md)
+                    if extracted:
+                        max_items = min(30, len(extracted))
+                        n_aud = st.slider("Auditoría: cantidad a incluir", 1, max_items, value=min(8, max_items))
+                        findings.extend(extracted[:n_aud])
+                    else:
+                        st.warning("No pude extraer hallazgos desde AUDITORIA_PROFUNDA.md (o el archivo está vacío).")
+
+                    sev = st.selectbox("Alertas: severidad", ["Todas", "Alta", "Media", "Baja"], index=1)
+                    n_al = st.slider("Alertas: cantidad a incluir", 1, 30, value=8)
+                    alert_findings = _extract_open_alert_findings(severity=sev, limit=n_al)
+                    if not alert_findings:
+                        st.warning("No hay alertas abiertas para esa severidad.")
+                    findings.extend(alert_findings)
+
+                    # Dedupe manteniendo orden
+                    seen = set()
+                    findings = [x for x in findings if not (x in seen or seen.add(x))]
+                    preview_lines = findings[:30]
+                    st.caption(f"Hallazgos combinados: {len(findings)}")
+                    st.text_area("Vista previa (solo lectura)", "\n".join(preview_lines), height=190, disabled=True)
+
+                elif src.startswith("📄"):
+                    source_label = "AUDITORIA_PROFUNDA.md"
+                    md = _read_text_file("AUDITORIA_PROFUNDA.md")
+                    extracted = _extract_audit_findings(md)
+                    if not extracted:
+                        st.warning("No pude extraer hallazgos desde AUDITORIA_PROFUNDA.md (o el archivo está vacío).")
+                    else:
+                        st.caption(f"Hallazgos detectados: {len(extracted)}")
+                        max_items = min(30, len(extracted))
+                        n = st.slider("Cantidad a incluir", 1, max_items, value=min(10, max_items))
+                        findings = extracted[:n]
+                        st.text_area("Vista previa (solo lectura)", "\n".join(findings), height=170, disabled=True)
+
+                elif src.startswith("🔔"):
+                    source_label = "Alertas abiertas"
+                    sev = st.selectbox("Severidad", ["Todas", "Alta", "Media", "Baja"], index=1)
+                    n_al = st.slider("Cantidad a incluir", 1, 30, value=10)
+                    findings = _extract_open_alert_findings(severity=sev, limit=n_al)
+                    if not findings:
+                        st.warning("No hay alertas abiertas para esa severidad.")
+                    else:
+                        st.text_area("Vista previa (solo lectura)", "\n".join(findings), height=190, disabled=True)
+
+                else:
+                    source_label = "Hallazgos pegados por el usuario"
+                    pasted = st.text_area(
+                        "Pega los hallazgos (uno por línea)",
+                        height=170,
+                        placeholder="Ej:\n- Hallazgo: ...\n- Hallazgo: ...\n- Limitación: ...",
+                    )
+                    findings = [ln.strip("- ").strip() for ln in pasted.splitlines() if ln.strip()]
+
+                colg1, colg2 = st.columns([1, 1])
+                with colg1:
+                    if st.button("🧠 Generar plan con Trace", key="ai_bulk_generate"):
+                        if not findings:
+                            st.warning("No hay hallazgos para analizar.")
+                        else:
+                            with st.spinner("Trace está generando el plan de mejora…"):
+                                try:
+                                    result = _trace_generate_plan(findings, ai_key)
+                                    st.session_state["_ai_bulk_plan"] = result
+                                except Exception as e:
+                                    st.error(f"Error al consultar Trace: {e}")
+                                    st.session_state.pop("_ai_bulk_plan", None)
+
+                bulk = st.session_state.get("_ai_bulk_plan")
+                if bulk:
+                    if "raw" in bulk:
+                        st.text_area("Respuesta de Trace", bulk["raw"], height=220, disabled=True)
+                    else:
+                        planes = bulk.get("planes", []) if isinstance(bulk, dict) else []
+                        if not isinstance(planes, list) or not planes:
+                            st.warning("Trace no devolvió una lista 'planes' válida.")
+                        else:
+                            # Normalizar para previsualización
+                            rows = []
+                            for it in planes:
+                                if not isinstance(it, dict):
+                                    continue
+                                rows.append(
+                                    {
+                                        "Hallazgo": it.get("hallazgo", ""),
+                                        "Riesgo": it.get("tipo_riesgo", ""),
+                                        "Nivel": _normalize_risk_level(it.get("nivel_riesgo", "")),
+                                        "Acción correctiva": it.get("accion_correctiva", ""),
+                                        "Capacitación": it.get("capacitacion", ""),
+                                        "KPI": it.get("indicador_kpi", ""),
+                                        "Plazo (días)": it.get("plazo_dias", ""),
+                                    }
+                                )
+                            st.subheader("Previsualización del plan")
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+                            if st.button("💾 Guardar planes en el módulo", key="ai_bulk_save"):
+                                existing = set(
+                                    query_df("SELECT finding FROM improvement_plans")["finding"].tolist()
+                                )
+                                saved = 0
+                                skipped = 0
+                                for it in planes:
+                                    if not isinstance(it, dict):
+                                        continue
+                                    finding_txt = str(it.get("hallazgo", "")).strip()
+                                    if not finding_txt or finding_txt in existing:
+                                        skipped += 1
+                                        continue
+                                    risk_type = str(it.get("tipo_riesgo", "")).strip() or "Hallazgo"
+                                    risk_level = _normalize_risk_level(it.get("nivel_riesgo", ""))
+                                    cause = str(it.get("causa_probable", "")).strip()
+                                    corr = str(it.get("accion_correctiva", "")).strip()
+                                    prev = str(it.get("accion_preventiva", "")).strip()
+                                    resp_role = str(it.get("responsable_rol", "")).strip()
+                                    try:
+                                        plazo = int(it.get("plazo_dias", 15) or 15)
+                                    except Exception:
+                                        plazo = 15
+                                    follow = (date.today() + timedelta(days=max(1, min(plazo, 365)))).isoformat()
+                                    evid = _format_plan_evidence(it, source_label)
+                                    execute(
+                                        """INSERT INTO improvement_plans(
+                                            finding,risk_type,risk_level,probable_cause,corrective_action,
+                                            preventive_action,responsible,follow_up_date,state,evidence,registered_by,created_at
+                                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        (
+                                            finding_txt,
+                                            risk_type,
+                                            risk_level,
+                                            cause,
+                                            corr,
+                                            prev,
+                                            resp_role,
+                                            follow,
+                                            "Pendiente",
+                                            evid,
+                                            st.session_state["user"],
+                                            datetime.now().isoformat(),
+                                        ),
+                                    )
+                                    saved += 1
+                                    existing.add(finding_txt)
+                                audit(
+                                    st.session_state["user"],
+                                    "Registro",
+                                    "Plan de mejora",
+                                    f"Trace bulk: guardados={saved}, omitidos={skipped}",
+                                )
+                                st.success(f"Planes guardados: {saved}. Omitidos (duplicados/vacíos): {skipped}.")
+                                st.rerun()
+
             with tab_chat:
                 if "_trace_history" not in st.session_state:
                     st.session_state["_trace_history"] = []
