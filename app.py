@@ -1499,11 +1499,88 @@ def alerts_module():
             audit(st.session_state["user"],"Cerrar alerta","Alertas",f"ID:{aid}")
             st.success("Alerta cerrada."); st.rerun()
 
+# ─── Asistente IA – Plan de mejora ───────────────────────────────────────────
+def _ai_suggest_improvement(finding: str, api_key: str) -> dict:
+    """Llama a OpenAI GPT y devuelve sugerencias para el plan de mejora."""
+    import openai, json
+    client = openai.OpenAI(api_key=api_key)
+    system = (
+        "Eres un experto en centrales de reprocesamiento de instrumental quirurgico. "
+        "Dado un hallazgo de no conformidad, responde SOLO con un objeto JSON con "
+        "exactamente estas claves: causa_probable, accion_correctiva, accion_preventiva, nivel_riesgo. "
+        "nivel_riesgo debe ser uno de: Bajo, Medio, Alto, Critico. "
+        "No incluyas texto adicional fuera del JSON."
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Hallazgo: {finding}"},
+        ],
+        temperature=0.3,
+        max_tokens=600,
+    )
+    raw = resp.choices[0].message.content.strip()
+    try:
+        clean = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(clean)
+    except Exception:
+        return {"raw": raw}
+
 # ─── Plan de mejora ───────────────────────────────────────────────────────────
 def improvement_module():
     st.header("5. Plan de mejora")
     st.info("💡 El sistema genera recomendaciones automáticas ante alertas críticas. También puede registrar hallazgos manualmente.")
     check_and_recommend()
+
+    # ── Asistente IA ──────────────────────────────────────────────────────────
+    with st.expander("🤖 Asistente IA – Sugerencias de план de mejora", expanded=False):
+        ai_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+        if not ai_key:
+            st.warning(
+                "⚠️ Clave de OpenAI no configurada. "
+                "Añade `OPENAI_API_KEY` en los secretos de Streamlit Cloud "
+                "(Settings → Secrets) o en `.streamlit/secrets.toml` localmente."
+            )
+        else:
+            st.write(
+                "Describe el hallazgo y el asistente sugerirá **causa probable**, "
+                "**acción correctiva**, **acción preventiva** y **nivel de riesgo**."
+            )
+            ai_finding = st.text_area(
+                "Hallazgo a analizar",
+                key="ai_finding_input",
+                height=90,
+                placeholder="Ej: Se detectó instrumental con residuos orgánicos tras el ciclo de limpieza.",
+            )
+            if st.button("✨ Sugerir con IA", key="ai_suggest_btn"):
+                if ai_finding.strip():
+                    with st.spinner("Consultando GPT…"):
+                        try:
+                            result = _ai_suggest_improvement(ai_finding.strip(), ai_key)
+                            st.session_state["_ai_sugg"] = result
+                        except Exception as e:
+                            st.error(f"Error al consultar la IA: {e}")
+                            st.session_state.pop("_ai_sugg", None)
+                else:
+                    st.warning("Ingresa el hallazgo antes de consultar.")
+
+            sugg = st.session_state.get("_ai_sugg")
+            if sugg:
+                if "raw" in sugg:
+                    st.text_area("Respuesta del asistente", sugg["raw"], height=160, disabled=True)
+                else:
+                    colA, colB = st.columns(2)
+                    colA.info(f"**Causa probable**\n\n{sugg.get('causa_probable', '')}")
+                    colB.warning(f"**Acción correctiva**\n\n{sugg.get('accion_correctiva', '')}")
+                    st.success(f"**Acción preventiva**\n\n{sugg.get('accion_preventiva', '')}")
+                    nivel = sugg.get("nivel_riesgo", sugg.get("nivel_riesgo", ""))
+                    st.caption(f"Nivel de riesgo sugerido: **{nivel}**")
+                    st.info(
+                        "Usa estas sugerencias para rellenar el formulario de registro a continuación.",
+                        icon="👇",
+                    )
+    # ─────────────────────────────────────────────────────────────────────────
     with st.expander("➕ Registrar nuevo plan",expanded=False):
         with st.form("imp_form"):
             finding=st.text_area("Hallazgo identificado *")
