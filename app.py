@@ -8,6 +8,7 @@
 # =============================================================================
 
 import streamlit as st
+import streamlit.components.v1 as st_components
 import pandas as pd
 import sqlite3
 import io, zipfile, os, base64
@@ -994,6 +995,46 @@ def chart_survey(df):
     ax.set_ylim(0,5); ax.set_title("Percepción del personal (escala 1–5)")
     ax.grid(axis="y",alpha=0.4); plt.tight_layout(); return fig
 
+def _survey_excel(df: pd.DataFrame) -> bytes:
+    """Genera un Excel con los resultados de la encuesta de percepción."""
+    LABELS = {
+        "id": "ID", "role": "Cargo / Rol", "experience_years": "Años de experiencia",
+        "q1": "P1 – Fácil de usar", "q2": "P2 – Facilita registro",
+        "q3": "P3 – Reduce errores", "q4": "P4 – Mejora trazabilidad",
+        "q5": "P5 – Control de etapas", "q6": "P6 – Optimiza tiempo",
+        "q7": "P7 – Comodidad de uso", "q8": "P8 – Seguridad del paciente",
+        "q9": "P9 – Organización del trabajo", "q10": "P10 – Recomendaría su uso",
+        "comments": "Comentarios", "created_at": "Fecha de registro",
+    }
+    out = df.rename(columns={k: v for k, v in LABELS.items() if k in df.columns})
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        wb = w.book
+        hf = wb.add_format({"bold": True, "bg_color": "#1F4E79", "font_color": "white", "border": 1})
+        tf = wb.add_format({"bold": True, "font_size": 13})
+        nf = wb.add_format({"italic": True, "font_color": "gray"})
+        out.to_excel(w, sheet_name="Encuestas", index=False, startrow=2)
+        s = w.sheets["Encuestas"]
+        s.write(0, 0, f"{APP_NAME} – Encuesta de percepción – {now}", tf)
+        s.write(1, 0, NOTA_ACAD, nf)
+        for i, col in enumerate(out.columns):
+            s.write(2, i, col, hf)
+            cw = max(len(str(col)) + 4, out[col].astype(str).str.len().max() + 2 if not out.empty else 10)
+            s.set_column(i, i, min(cw, 50))
+        s.autofilter(2, 0, 2 + len(out), len(out.columns) - 1)
+        # Hoja de promedios por pregunta
+        means = df[[f"q{i}" for i in range(1,11)]].mean().round(2)
+        ws2 = wb.add_worksheet("Promedios por pregunta")
+        ws2.write(0, 0, f"{APP_NAME} – Promedios – {now}", tf)
+        ws2.write(2, 0, "Pregunta", hf); ws2.write(2, 1, "Promedio (1-5)", hf)
+        labels = [LABELS.get(f"q{i}", f"P{i}") for i in range(1,11)]
+        for r, (label, val) in enumerate(zip(labels, means.values)):
+            ws2.write(3 + r, 0, label); ws2.write(3 + r, 1, float(val))
+        ws2.set_column(0, 0, 50); ws2.set_column(1, 1, 20)
+    buf.seek(0)
+    return buf.read()
+
 # ─── Excel ───────────────────────────────────────────────────────────────────
 def generate_excel():
     rec=query_df("SELECT * FROM process_records")
@@ -1206,6 +1247,41 @@ def login_screen():
                     else:
                         st.error(msg)
 
+def _live_avatar_floating():
+    """Inyecta el widget LiveAvatar como iframe flotante fijo en la esquina inferior derecha."""
+    _la_key = st.secrets.get("liveavatar", {}).get("api_key", "")
+    _la_params = "?orientation=horizontal"
+    if _la_key and _la_key not in ("PEGA_AQUI_TU_CLAVE_API", "tu_clave_aqui", ""):
+        _la_params += f"&api_key={_la_key}"
+    avatar_url = f"https://embed.liveavatar.com/v1/c46cf5ac-deb0-4078-8d23-a0438f4d3482{_la_params}"
+    # JS que escapa el sandbox de components.html e inyecta el iframe en el DOM raíz
+    st_components.html(f"""
+    <script>
+    (function() {{
+        var _id = 'liveavatar-floating-widget';
+        if (window.parent.document.getElementById(_id)) return;
+        var iframe = window.parent.document.createElement('iframe');
+        iframe.id = _id;
+        iframe.src = '{avatar_url}';
+        iframe.allow = 'microphone';
+        iframe.title = 'Asistente LiveAvatar';
+        iframe.style.cssText = [
+            'position:fixed',
+            'bottom:24px',
+            'right:24px',
+            'width:320px',
+            'height:200px',
+            'border:none',
+            'border-radius:14px',
+            'box-shadow:0 6px 32px rgba(0,0,0,0.5)',
+            'z-index:99999',
+            'background:#0d1b2a',
+        ].join(';');
+        window.parent.document.body.appendChild(iframe);
+    }})();
+    </script>
+    """, height=0, scrolling=False)
+
 def header():
     """
     Encabezado del panel interno post-login.
@@ -1251,6 +1327,8 @@ def header():
         audit(st.session_state["user"],"Cierre de sesión","Login")
         st.session_state.clear(); st.rerun()
     st.sidebar.markdown(inst_footer())
+    # ── Asistente LiveAvatar (widget flotante) ───────────────────────────────
+    _live_avatar_floating()
 
 # ─── Panel principal ──────────────────────────────────────────────────────────
 def dashboard():
@@ -2367,9 +2445,58 @@ def survey_module():
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(role,exp,*ans,comm,datetime.now().isoformat()))
             audit(st.session_state["user"],"Encuesta","Encuesta",f"Cargo:{role}")
             st.success("¡Encuesta guardada!")
-    df=query_df("SELECT * FROM staff_survey ORDER BY created_at DESC")
+
+    # ── Resultados almacenados (siempre persistentes) ─────────────────────────
+    df = query_df("SELECT * FROM staff_survey ORDER BY created_at DESC")
     if not df.empty:
-        fig=chart_survey(df); st.pyplot(fig); _get_plt().close(fig)
+        st.subheader(f"📋 Resultados almacenados ({len(df)} respuestas)")
+        st.dataframe(df, use_container_width=True)
+
+        st.subheader("📊 Gráfica de promedios por pregunta")
+        fig = chart_survey(df)
+        st.pyplot(fig)
+
+        # ── Exportaciones ─────────────────────────────────────────────────────
+        st.subheader("📥 Exportar resultados")
+        col_xls, col_png = st.columns(2)
+        with col_xls:
+            excel_bytes = _survey_excel(df)
+            st.download_button(
+                label="📊 Descargar Excel",
+                data=excel_bytes,
+                file_name=f"encuesta_percepcion_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with col_png:
+            img_bytes = fig_bytes(fig)
+            st.download_button(
+                label="🖼️ Descargar gráfica (PNG)",
+                data=img_bytes,
+                file_name=f"grafica_encuesta_{date.today()}.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+        _get_plt().close(fig)
+    else:
+        st.info("Aún no hay respuestas registradas.")
+
+    # ── Borrado exclusivo para administrador ──────────────────────────────────
+    if st.session_state.get("role") == "Administrador":
+        st.divider()
+        with st.expander("🗑️ Zona de administrador – Eliminar encuestas"):
+            st.warning("⚠️ Esta acción es irreversible y eliminará TODAS las respuestas.")
+            confirm_del = st.text_input(
+                "Escriba ELIMINAR para confirmar el borrado de todas las encuestas",
+                key="surv_del_confirm",
+            )
+            if confirm_del == "ELIMINAR":
+                if st.button("🗑️ Borrar todas las encuestas", type="primary", use_container_width=True):
+                    execute("DELETE FROM staff_survey")
+                    audit(st.session_state["user"], "Borrar encuestas", "Encuesta",
+                          "Todas las encuestas eliminadas por administrador")
+                    st.success("Encuestas eliminadas correctamente.")
+                    st.rerun()
 
 # ─── Auditoría ────────────────────────────────────────────────────────────────
 def audit_module():
@@ -2429,8 +2556,10 @@ def config_module():
         confirm=st.text_input("Escriba CONFIRMAR para limpiar datos de prueba")
         if confirm=="CONFIRMAR":
             if st.button("🗑️ Limpiar datos de prueba"):
-                for t in ["process_records","alerts","improvement_plans","staff_survey","audit_log"]:
+                for t in ["process_records","alerts","improvement_plans","audit_log"]:
                     execute(f"DELETE FROM {t}")
+                # Las encuestas de percepción NO se eliminan con el reset de demo;
+                # solo el administrador puede borrarlas desde la sección 7.
                 execute("DELETE FROM instruments WHERE registered_by='sistema'")
                 seed_demo_data()
                 audit(st.session_state["user"],"Limpieza demo","Config","Datos de demostración reiniciados")

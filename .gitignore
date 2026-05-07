@@ -1,3 +1,6 @@
+# Secretos de Streamlit (NUNCA subir al repositorio)
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]
