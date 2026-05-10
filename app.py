@@ -813,6 +813,7 @@ AUTO_REC = {
     "Paquete vencido":                 "Retirar inmediatamente del almacenamiento. No distribuir. Evaluar reprocesamiento completo desde Limpieza y descontaminación.",
     "Tiempo insuficiente en etapa":     "Verificar el registro de fecha/hora de inicio y fin. Si el tiempo fue real, documentar desviación y evaluar reprocesamiento según protocolo del servicio.",
     "Tiempo de exposición insuficiente": "RECHAZAR LA CARGA. Exposición por debajo del mínimo normativo no garantiza esterilidad. Reprocesar con parámetros correctos y verificar calibración del equipo.",
+    "Etapa duplicada":                   "Revisar si el segundo registro corresponde a un reproceso justificado o a un error de digitación. Documentar la causa y corregir la trazabilidad del lote.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -1567,11 +1568,31 @@ def process_module():
             ps=b.selectbox("Estado del paquete al entregar",["Íntegro","Dañado"])
 
         obs=st.text_area("Observaciones generales")
+        # Advertencia de etapa ya registrada (visible antes de enviar)
+        if batch.strip():
+            _dup_chk=query_df(
+                "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
+                (code,batch.strip(),stage))
+            if not _dup_chk.empty:
+                _dr=_dup_chk.iloc[0]
+                st.warning(f"⚠️ Esta etapa ya fue registrada para este lote — "
+                           f"{_dr['created_at'][:16]} por {_dr['responsible']}. "
+                           "Si guarda de nuevo, quedará como registro adicional (desviación).")
         submit=st.form_submit_button("💾 Guardar etapa")
 
     if submit:
         if not batch.strip() or not resp.strip():
             st.error("Lote/carga y responsable son obligatorios."); return
+        # Detección de etapa duplicada
+        _dup=query_df(
+            "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
+            (code,batch.strip(),stage))
+        if not _dup.empty:
+            _dr=_dup.iloc[0]
+            add_alert(code,batch.strip(),"Etapa duplicada","Media",
+                      f"'{stage}' fue registrada más de una vez para este lote. "
+                      f"Primer registro: {_dr['created_at'][:16]} por {_dr['responsible']}. "
+                      "Revisar si corresponde a reprocesamiento o error de digitación.")
         ok,msg=validate_stage_order(code,batch.strip(),stage)
         if not ok: st.warning(f"⚠️ {msg} Se guarda como desviación académica.")
         s_dt=datetime.combine(sd,st_); e_dt=datetime.combine(ed,et)
