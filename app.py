@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as st_components
 import pandas as pd
 import sqlite3
-import io, zipfile, os, base64, smtplib, ssl, hmac
+import io, zipfile, os, base64, smtplib, ssl, hmac, json
 from datetime import datetime, date, timedelta
 from textwrap import wrap
 
@@ -489,7 +489,7 @@ def render_login_card():
                         (u, role, "Inicio de sesión", datetime.now().isoformat()))
                 audit(u, "Inicio de sesión", "Login")
                 st.rerun()
-            elif u in USERS and hmac.compare_digest(USERS[u]["password"], p):
+            elif u in USERS and _check_password(p, USERS[u]["password"]):
                 role = USERS[u]["role"]
                 st.session_state.update({"login": True, "user": u, "role": role})
                 execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
@@ -902,6 +902,7 @@ def init_db():
         expiration_date TEXT,
         destination_service TEXT, delivery_responsible TEXT,
         reception_responsible TEXT, package_state_delivery TEXT,
+        consumable_lots_used TEXT,
         observations TEXT, registered_by TEXT, created_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1002,6 +1003,26 @@ def init_db():
         created_at TEXT)""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_equip_id       ON equipment_calibration(equipment_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_next_cal_date  ON equipment_calibration(next_calibration_date)")
+    # equipment_maintenance: mantenimiento preventivo y correctivo (ISO 17665-1:2006 §10.4 / AAMI ST79:2017 §12.3)
+    cur.execute("""CREATE TABLE IF NOT EXISTS equipment_maintenance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        equipment_id       TEXT NOT NULL,
+        equipment_name     TEXT NOT NULL,
+        maintenance_type   TEXT NOT NULL DEFAULT 'Preventivo',
+        maintenance_date   TEXT NOT NULL,
+        technician         TEXT,
+        supplier           TEXT,
+        work_description   TEXT NOT NULL,
+        next_maintenance_date TEXT,
+        cost               REAL,
+        work_order         TEXT,
+        result             TEXT NOT NULL DEFAULT 'Conforme',
+        observations       TEXT,
+        registered_by      TEXT,
+        created_at         TEXT)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_em_equip_id       ON equipment_maintenance(equipment_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_em_maint_date     ON equipment_maintenance(maintenance_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_em_next_date      ON equipment_maintenance(next_maintenance_date)")
     # nonconformities: no conformidades vinculadas a alertas (ISO 13485:2016 §8.7 / Res. 4816/2008)
     cur.execute("""CREATE TABLE IF NOT EXISTS nonconformities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1024,6 +1045,45 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_alert_id      ON nonconformities(alert_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_code_batch    ON nonconformities(instrument_code, batch_code)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_status        ON nonconformities(status)")
+    # sets quirúrgicos (Mejora W): cabecera y miembros del set
+    cur.execute("""CREATE TABLE IF NOT EXISTS surgical_sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        set_code    TEXT UNIQUE NOT NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        service     TEXT,
+        status      TEXT NOT NULL DEFAULT 'Activo',
+        registered_by TEXT,
+        created_at  TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS set_instruments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        set_code        TEXT NOT NULL,
+        instrument_code TEXT NOT NULL,
+        position        INTEGER DEFAULT 1,
+        notes           TEXT,
+        added_by        TEXT,
+        created_at      TEXT,
+        UNIQUE(set_code, instrument_code))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ss_status        ON surgical_sets(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_si_set_code      ON set_instruments(set_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_si_instrument    ON set_instruments(instrument_code)")
+    # insumos consumibles (Mejora X): control de vencimiento de lotes
+    cur.execute("""CREATE TABLE IF NOT EXISTS consumable_lots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lot_number      TEXT NOT NULL,
+        cons_type       TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        brand           TEXT,
+        quantity        REAL,
+        unit            TEXT,
+        expiration_date TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'Activo',
+        observations    TEXT,
+        registered_by   TEXT,
+        created_at      TEXT,
+        UNIQUE(lot_number, cons_type))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cl_type_status ON consumable_lots(cons_type, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cl_expiration  ON consumable_lots(expiration_date)")
     c.commit(); c.close()
 
 def _migrate_db():
@@ -1068,6 +1128,33 @@ def _migrate_db():
         observations TEXT,
         registered_by TEXT,
         created_at TEXT)""")
+    # ─ Mantenimiento de equipos (Mejora Z) ────────────────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS equipment_maintenance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        equipment_id       TEXT NOT NULL,
+        equipment_name     TEXT NOT NULL,
+        maintenance_type   TEXT NOT NULL DEFAULT 'Preventivo',
+        maintenance_date   TEXT NOT NULL,
+        technician         TEXT,
+        supplier           TEXT,
+        work_description   TEXT NOT NULL,
+        next_maintenance_date TEXT,
+        cost               REAL,
+        work_order         TEXT,
+        result             TEXT NOT NULL DEFAULT 'Conforme',
+        observations       TEXT,
+        registered_by      TEXT,
+        created_at         TEXT)""")
+    c.commit()
+    for em_idx in [
+        "CREATE INDEX IF NOT EXISTS idx_em_equip_id   ON equipment_maintenance(equipment_id)",
+        "CREATE INDEX IF NOT EXISTS idx_em_maint_date ON equipment_maintenance(maintenance_date)",
+        "CREATE INDEX IF NOT EXISTS idx_em_next_date  ON equipment_maintenance(next_maintenance_date)",
+    ]:
+        try:
+            c.execute(em_idx); c.commit()
+        except sqlite3.OperationalError:
+            pass
     c.execute("""CREATE TABLE IF NOT EXISTS nonconformities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         alert_id       INTEGER,
@@ -1097,6 +1184,7 @@ def _migrate_db():
         "ALTER TABLE instruments ADD COLUMN manufacturer TEXT",
         "ALTER TABLE instruments ADD COLUMN model TEXT",
         "ALTER TABLE instruments ADD COLUMN max_cycles INTEGER",
+        "ALTER TABLE process_records ADD COLUMN consumable_lots_used TEXT",
     ]:
         try:
             c.execute(stmt); c.commit()
@@ -1125,9 +1213,6 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_nc_alert_id      ON nonconformities(alert_id)",
         "CREATE INDEX IF NOT EXISTS idx_nc_code_batch    ON nonconformities(instrument_code, batch_code)",
         "CREATE INDEX IF NOT EXISTS idx_nc_status        ON nonconformities(status)",
-        "CREATE INDEX IF NOT EXISTS idx_bi_code_batch    ON biological_indicators(instrument_code, batch_code)",
-        "CREATE INDEX IF NOT EXISTS idx_bi_result        ON biological_indicators(result)",
-        "CREATE INDEX IF NOT EXISTS idx_bi_expected      ON biological_indicators(expected_completion)",
     ]
     for stmt in idx_stmts:
         try:
@@ -1135,6 +1220,8 @@ def _migrate_db():
         except sqlite3.OperationalError:
             pass
     # ─ Tabla indicadores biológicos (Mejora V) ──────────────────────────
+    # NOTA: la tabla debe crearse ANTES de sus índices para que éstos se
+    # apliquen correctamente en una BD nueva (idx_bi_* dependen de la tabla).
     c.execute("""CREATE TABLE IF NOT EXISTS biological_indicators (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         instrument_code   TEXT NOT NULL,
@@ -1153,6 +1240,69 @@ def _migrate_db():
         registered_by     TEXT,
         created_at        TEXT)""")
     c.commit()
+    # ─ Índices de biological_indicators (deben ir DESPUÉS de crear la tabla) ─
+    for bi_idx in [
+        "CREATE INDEX IF NOT EXISTS idx_bi_code_batch ON biological_indicators(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_bi_result     ON biological_indicators(result)",
+        "CREATE INDEX IF NOT EXISTS idx_bi_expected   ON biological_indicators(expected_completion)",
+    ]:
+        try:
+            c.execute(bi_idx); c.commit()
+        except sqlite3.OperationalError:
+            pass
+    # ─ Sets quirúrgicos (Mejora W) ───────────────────────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS surgical_sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        set_code    TEXT UNIQUE NOT NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        service     TEXT,
+        status      TEXT NOT NULL DEFAULT 'Activo',
+        registered_by TEXT,
+        created_at  TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS set_instruments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        set_code        TEXT NOT NULL,
+        instrument_code TEXT NOT NULL,
+        position        INTEGER DEFAULT 1,
+        notes           TEXT,
+        added_by        TEXT,
+        created_at      TEXT,
+        UNIQUE(set_code, instrument_code))""")
+    c.commit()
+    for si_idx in [
+        "CREATE INDEX IF NOT EXISTS idx_ss_status     ON surgical_sets(status)",
+        "CREATE INDEX IF NOT EXISTS idx_si_set_code   ON set_instruments(set_code)",
+        "CREATE INDEX IF NOT EXISTS idx_si_instrument ON set_instruments(instrument_code)",
+    ]:
+        try:
+            c.execute(si_idx); c.commit()
+        except sqlite3.OperationalError:
+            pass
+    # ─ Insumos consumibles (Mejora X) ────────────────────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS consumable_lots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lot_number      TEXT NOT NULL,
+        cons_type       TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        brand           TEXT,
+        quantity        REAL,
+        unit            TEXT,
+        expiration_date TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'Activo',
+        observations    TEXT,
+        registered_by   TEXT,
+        created_at      TEXT,
+        UNIQUE(lot_number, cons_type))""")
+    c.commit()
+    for cl_idx in [
+        "CREATE INDEX IF NOT EXISTS idx_cl_type_status ON consumable_lots(cons_type, status)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_expiration  ON consumable_lots(expiration_date)",
+    ]:
+        try:
+            c.execute(cl_idx); c.commit()
+        except sqlite3.OperationalError:
+            pass
     c.close()
 
 def seed_demo_data():
@@ -1409,12 +1559,6 @@ def _check_equipment_calibration(equipment_id: str) -> None:
     today = date.today()
     days_left = (next_cal - today).days
 
-    def _has_open(atype):
-        ex = query_df(
-            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type=? AND status='Abierta'",
-            (equipment_id,))
-        return not ex.empty and (ex["alert_type"] == atype).any() if "alert_type" in ex.columns else not ex.empty
-
     # Reutilizamos instrument_code para identificar equipo en la tabla de alertas
     if days_left < 0:
         ex = query_df(
@@ -1512,6 +1656,66 @@ def _calc_failure_rate(rec):
     fallidos = sum(1 for _,g in lotes if (g["result"]=="Rechazado").any())
     tasa = (fallidos/total*100) if total else 0
     return round(tasa,1), fallidos, total
+
+def _get_valid_consumable_lots(cons_type: str) -> list:
+    """Devuelve lista de strings 'Lote | Nombre | vence YYYY-MM-DD' para lotes activos no vencidos."""
+    today = date.today().isoformat()
+    df = query_df(
+        "SELECT lot_number, name, brand, expiration_date "
+        "FROM consumable_lots "
+        "WHERE cons_type=? AND status='Activo' AND expiration_date >= ? "
+        "ORDER BY expiration_date ASC",
+        (cons_type, today))
+    if df.empty:
+        return []
+    opts = []
+    for _, r in df.iterrows():
+        brand_str = f" – {r['brand']}" if str(r.get("brand", "")).strip() else ""
+        opts.append(f"{r['lot_number']} | {r['name']}{brand_str} | vence {r['expiration_date']}")
+    return opts
+
+
+def _check_expiring_consumables() -> None:
+    """Genera alertas automáticas para lotes de insumos vencidos o próximos a vencer (≤ 30 días).
+
+    Idempotente: no duplica alertas abiertas del mismo tipo para el mismo lote.
+    Referencia: ISO 11607-1:2019 §7.2 / AAMI ST79:2017 §8.3.
+    """
+    df = query_df(
+        "SELECT lot_number, cons_type, name, expiration_date "
+        "FROM consumable_lots WHERE status='Activo'")
+    if df.empty:
+        return
+    today = date.today()
+    for _, r in df.iterrows():
+        try:
+            exp = date.fromisoformat(str(r["expiration_date"]))
+        except (ValueError, TypeError):
+            continue
+        days = (exp - today).days
+        lot_id     = str(r["lot_number"])
+        cons_label = f"{r['cons_type']} – {r['name']}"
+        alert_code = f"CONS:{lot_id}"   # prefijo para reutilizar tabla alerts
+        if days < 0:
+            atype = "Insumo vencido"
+            sev   = "Alta"
+            desc  = (f"Lote '{lot_id}' ({cons_label}) vencido desde {r['expiration_date']} "
+                     f"({abs(days)} día(s) de atraso). NO UTILIZAR en ningún proceso. "
+                     "Retire del inventario. (ISO 11607-1:2019 §7.2 / AAMI ST79:2017 §8.3)")
+        elif days <= 30:
+            atype = "Insumo próximo a vencer"
+            sev   = "Media"
+            desc  = (f"Lote '{lot_id}' ({cons_label}) vence el {r['expiration_date']} "
+                     f"({days} día(s) restantes). Planifique reposición. "
+                     "(ISO 11607-1:2019 §7.2 / AAMI ST79:2017 §8.3)")
+        else:
+            continue
+        ex = query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type=? AND status='Abierta'",
+            (alert_code, atype))
+        if ex.empty:
+            add_alert(alert_code, "—", atype, sev, desc)
+
 
 def _check_expiring_packages():
     """Genera alertas automáticas por paquetes vencidos o próximos a vencer (≤ 7 días)."""
@@ -2050,6 +2254,55 @@ def dashboard():
     if red:   st.error(f"🔴 {red} ALERTA(S) DE RIESGO ALTO ABIERTAS. Revise el módulo de Alertas.")
     elif len(al): st.warning("🟡 Hay alertas abiertas de nivel medio.")
     else:     st.success("🟢 Sin alertas abiertas. Situación controlada.")
+    # ── Mini-scorecard normativo ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Cumplimiento normativo (resumen)")
+    sc_mini = _compute_scorecard()
+    sc_mini_target = 90.0   # meta fija para el dashboard; ajustable en el módulo completo
+    cms = st.columns(len(sc_mini))
+    for i_s, (norm_s, data_s) in enumerate(sc_mini.items()):
+        s_val = data_s["score"]
+        ico_s = _sc_semaforo(s_val, sc_mini_target)
+        clr_s = _sc_color(s_val, sc_mini_target)
+        lbl_s = norm_s.replace(" §9", "").replace(" / EN 285", "/EN285")
+        prev_global = round(sum(v["score"] for v in sc_mini.values()) / len(sc_mini), 1)
+        cms[i_s].metric(
+            label=f"{ico_s} {lbl_s}",
+            value=f"{s_val}%",
+            delta=f"{s_val - sc_mini_target:+.1f}pp vs meta",
+            delta_color="normal",
+            help=f"Meta: {int(sc_mini_target)}% | Ir a 📋 Scorecard normativo para detalles.",
+        )
+    st.caption(
+        f"Scorecard global: **{prev_global}%** · Meta: {int(sc_mini_target)}% · "
+        "Ver módulo '📋 Scorecard normativo' para análisis detallado."
+    )
+    # ── Mini-panel de mantenimiento de equipos ────────────────────────────────
+    _df_maint_dash = query_df(
+        "SELECT equipment_id, equipment_name, next_maintenance_date "
+        "FROM equipment_maintenance "
+        "WHERE next_maintenance_date IS NOT NULL AND next_maintenance_date != '' "
+        "ORDER BY equipment_id, next_maintenance_date DESC"
+    )
+    if not _df_maint_dash.empty:
+        _today_dash = date.today()
+        _df_maint_uniq = _df_maint_dash.drop_duplicates(subset=["equipment_id"], keep="first")
+        def _maint_days(d):
+            try: return (date.fromisoformat(str(d)) - _today_dash).days
+            except (ValueError, TypeError): return 9999
+        _df_maint_uniq = _df_maint_uniq.copy()
+        _df_maint_uniq["_days"] = _df_maint_uniq["next_maintenance_date"].apply(_maint_days)
+        _n_venc_d = int((_df_maint_uniq["_days"] < 0).sum())
+        _n_prox_d = int(((_df_maint_uniq["_days"] >= 0) & (_df_maint_uniq["_days"] <= 30)).sum())
+        if _n_venc_d or _n_prox_d:
+            st.subheader("🛠️ Estado de mantenimiento de equipos")
+            _ma1, _ma2 = st.columns(2)
+            if _n_venc_d:
+                _ma1.error(f"🔴 {_n_venc_d} equipo(s) con mantenimiento **vencido** "
+                           f"— ir a 🛠️ Mantenimiento de equipos.")
+            if _n_prox_d:
+                _ma2.warning(f"🟡 {_n_prox_d} equipo(s) con mantenimiento próximo (≤ 30 días).")
+    st.markdown("---")
     st.subheader("Ruta de reprocesamiento")
     st.write("  →  ".join(STAGES))
     if not rec.empty:
@@ -2066,6 +2319,8 @@ def dashboard():
         st.success("Sin alertas abiertas.")
     # Panel de paquetes próximos a vencer
     _check_expiring_packages()
+    _check_expiring_consumables()
+    _check_maintenance_alerts()
     _alm_exp=query_df(
         "SELECT instrument_code,batch_code,expiration_date FROM process_records "
         "WHERE stage='Almacenamiento' AND expiration_date IS NOT NULL AND expiration_date!=''")
@@ -2370,6 +2625,8 @@ def process_module():
         sl=s_d=p_c=ex_d=""
         ds=dr=rr=ps=""
         pat_id=pat_init=proc_type=or_room=""
+        # lotes de insumos consumibles (Mejora X)
+        cons_pkg_lot=cons_ci_ext_lot=cons_ci_int_lot=cons_bi_lot=""
 
         if stage=="Recepción":
             r_ori=st.text_input("Servicio de origen")
@@ -2386,6 +2643,21 @@ def process_module():
             a,b=st.columns(2)
             ce_e=a.selectbox("Indicador químico externo",["Conforme","No conforme","No aplica"])
             ce_i=b.selectbox("Indicador químico interno",["Conforme","No conforme","No aplica"])
+            st.markdown("**📦 Lotes de insumos utilizados** *(ISO 11607-1:2019 / AAMI ST79:2017 §8.3)*")
+            st.caption("⚠️ Los lotes vencidos son bloqueados automáticamente al guardar.")
+            _pkg_opts = ["\u2014 No registrar \u2014"] + \
+                _get_valid_consumable_lots("Papel grado médico") + \
+                _get_valid_consumable_lots("Bolsa de poliamida/polietileno") + \
+                _get_valid_consumable_lots("Tela SMS / Meltblown") + \
+                _get_valid_consumable_lots("Contenedor rígido (filtro/membrana)")
+            _ci_opts = ["\u2014 No registrar \u2014"] + \
+                _get_valid_consumable_lots("Indicador químico clase 1 (cinta)") + \
+                _get_valid_consumable_lots("Indicador químico clase 4/5/6") + \
+                _get_valid_consumable_lots("Cinta adhesiva indicadora")
+            ea1, ea2, ea3 = st.columns(3)
+            cons_pkg_lot     = ea1.selectbox("Lote: material de empaque", _pkg_opts, key="cons_pkg")
+            cons_ci_ext_lot  = ea2.selectbox("Lote: IQ externo", _ci_opts, key="cons_ci_ext")
+            cons_ci_int_lot  = ea3.selectbox("Lote: IQ interno", _ci_opts, key="cons_ci_int")
         elif stage=="Esterilización":
             _prev_ins=query_df(
                 "SELECT inspection_status FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Inspección funcional' ORDER BY created_at DESC LIMIT 1",
@@ -2433,6 +2705,9 @@ def process_module():
                                       placeholder="Nombre del supervisor o jefe de central",
                                       key="release_sup",
                                       help="Debe ser una persona distinta al responsable principal del registro.")
+            st.markdown("**🧫 Lote de indicador biológico** *(ISO 11138 / AAMI ST79:2017 §10)*")
+            _bi_opts = ["\u2014 No registrar \u2014"] + _get_valid_consumable_lots("Indicador biológico")
+            cons_bi_lot = st.selectbox("Lote: indicador biológico", _bi_opts, key="cons_bi")
         elif stage=="Almacenamiento":
             a,b=st.columns(2)
             sl=a.text_input("Ubicación",placeholder="Estante A – Nivel 2")
@@ -2491,6 +2766,37 @@ def process_module():
                          "diferente al responsable principal del registro. "
                          "No se permite que una misma persona actúe como técnico y supervisor "
                          "(AAMI ST79:2017 §12 / IAHCSMM)."); return
+        # ─ Bloqueo por insumo consumible vencido (ISO 11607-1:2019 / AAMI ST79:2017 §8.3) ────
+        _cons_selected = {
+            "Material de empaque":       cons_pkg_lot,
+            "Indicador químico externo": cons_ci_ext_lot,
+            "Indicador químico interno": cons_ci_int_lot,
+            "Indicador biológico":        cons_bi_lot,
+        }
+        _cons_expired = []
+        for _clabel, _csel in _cons_selected.items():
+            if not _csel or _csel.startswith("\u2014"):
+                continue
+            _clot = _csel.split("|")[0].strip()
+            _crow = query_df(
+                "SELECT expiration_date FROM consumable_lots WHERE lot_number=? AND status='Activo'",
+                (_clot,))
+            if not _crow.empty:
+                try:
+                    _cexp = date.fromisoformat(str(_crow.iloc[0]["expiration_date"]))
+                    if date.today() >= _cexp:
+                        _cons_expired.append(
+                            f"{_clabel}: lote '{_clot}' vencido el {_crow.iloc[0]['expiration_date']}")
+                except (ValueError, TypeError):
+                    pass
+        if _cons_expired:
+            st.error(
+                "🔴 BLOQUEO — INSUMO(S) VENCIDO(S) (ISO 11607-1:2019 §7.2 / AAMI ST79:2017 §8.3):\n"
+                + "\n".join(f"  • {m}" for m in _cons_expired)
+                + "\n\nNo está permitido utilizar insumos vencidos en el reprocesamiento. "
+                "Seleccione un lote vigente o registre un nuevo lote en '📦 Insumos y consumibles'."
+            )
+            return
         # Detección de etapa duplicada
         _dup=query_df(
             "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
@@ -2505,6 +2811,17 @@ def process_module():
         if not ok: st.warning(f"⚠️ {msg} Se guarda como desviación académica.")
         s_dt=datetime.combine(sd,st_); e_dt=datetime.combine(ed,et)
         if e_dt<s_dt: st.error("Hora final no puede ser anterior a la inicial."); return
+        # ─ Construir JSON de lotes de insumos utilizados (Mejora X) ───────────────
+        _cons_used: dict = {}
+        if cons_pkg_lot and not cons_pkg_lot.startswith("\u2014"):
+            _cons_used["empaque"]  = cons_pkg_lot.split("|")[0].strip()
+        if cons_ci_ext_lot and not cons_ci_ext_lot.startswith("\u2014"):
+            _cons_used["ci_ext"]  = cons_ci_ext_lot.split("|")[0].strip()
+        if cons_ci_int_lot and not cons_ci_int_lot.startswith("\u2014"):
+            _cons_used["ci_int"]  = cons_ci_int_lot.split("|")[0].strip()
+        if cons_bi_lot and not cons_bi_lot.startswith("\u2014"):
+            _cons_used["bi"]      = cons_bi_lot.split("|")[0].strip()
+        _cons_json = json.dumps(_cons_used, ensure_ascii=False) if _cons_used else ""
         if stage=="Esterilización":
             _ins_mant=query_df(
                 "SELECT inspection_status FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Inspección funcional' ORDER BY created_at DESC LIMIT 1",
@@ -2587,13 +2904,13 @@ def process_module():
             physical_indicator,chemical_indicator,biological_indicator,release_result,release_supervisor,
             storage_location,storage_date,package_condition,expiration_date,
             destination_service,delivery_responsible,reception_responsible,package_state_delivery,
-            observations,registered_by,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            consumable_lots_used,observations,registered_by,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (code,batch.strip(),stage,resp,s_dt.isoformat(),e_dt.isoformat(),dur,complies,result,
              r_ori,r_sta,r_qty,cl_m,cl_c,cl_n,ins_s,pk_t,ce_e,ce_i,
              st_e,cy_t,temp,pres,exp_t,ld_n,act_temp,act_pres,act_exp_t,
              ph_i,ch_i,bi_i,rel,release_sup.strip(),
-             sl,s_d,p_c,ex_d,ds,dr,rr,ps,obs,st.session_state["user"],datetime.now().isoformat()))
+             sl,s_d,p_c,ex_d,ds,dr,rr,ps,_cons_json,obs,st.session_state["user"],datetime.now().isoformat()))
         audit(st.session_state["user"],"Registro etapa","Proceso",f"{code}/{batch}/{stage}")
         if stage=="Validación / liberación de carga" and rel=="Aprobado":
             audit(st.session_state["user"],"Doble verificación — Liberación aprobada","Proceso",
@@ -2659,6 +2976,7 @@ def process_module():
                 add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación de carga aprobada.")
         check_and_recommend()
         _check_expiring_packages()
+        _check_expiring_consumables()
         if stage=="Esterilización":
             _check_instrument_lifecycle(code)
             if st_e and st_e.strip():
@@ -4839,6 +5157,1518 @@ def biological_indicators_module():
 
 
 
+# ─── Insumos y consumibles (Mejora X) ───────────────────────────────────────
+# Tipos de insumo reconocidos por el sistema
+_CONS_TYPES = [
+    "Indicador químico clase 1 (cinta)",
+    "Indicador químico clase 4/5/6",
+    "Indicador biológico",
+    "Papel grado médico",
+    "Bolsa de poliamida/polietileno",
+    "Tela SMS / Meltblown",
+    "Contenedor rígido (filtro/membrana)",
+    "Cinta adhesiva indicadora",
+    "Detergente / enzimático",
+    "Otro insumo de proceso",
+]
+_CONS_UNITS = ["unidades", "rollos", "cajas", "metros", "litros", "kg", "pares"]
+
+
+def consumables_module():
+    """Control de vencimiento de insumos consumibles de la central.
+
+    Referencia: ISO 11607-1:2019 / AAMI ST79:2017 §8.3.
+    """
+    st.header("📦 Insumos y consumibles")
+    st.caption(
+        "Referencia: ISO 11607-1:2019 — Envasado de dispositivos médicos estériles / "
+        "AAMI ST79:2017 §8.3 — Control de materiales y fechas de vencimiento."
+    )
+    user = st.session_state["user"]
+    _check_expiring_consumables()   # generar alertas al entrar al módulo
+
+    tab_reg, tab_stock, tab_exp = st.tabs([
+        "➕ Registrar lote",
+        "📋 Inventario",
+        "⚠️ Control de vencimiento",
+    ])
+
+    # ── Tab 1: Registrar lote ─────────────────────────────────────────────────
+    with tab_reg:
+        st.subheader("Registrar nuevo lote de insumo")
+        with st.form("cons_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            lot_num    = c1.text_input("N° de lote del insumo *", placeholder="CI-EXT-2026-001",
+                                       help="Número de lote impreso en el envase. Debe ser único por tipo de insumo.")
+            cons_name  = c2.text_input("Nombre / descripción *", placeholder="Indicador Steri-Chek clase 4")
+            c3, c4 = st.columns(2)
+            cons_type  = c3.selectbox("Tipo de insumo *", _CONS_TYPES)
+            cons_brand = c4.text_input("Marca / fabricante", placeholder="3M, Crosstex, Hu-Friedy…")
+            c5, c6, c7 = st.columns(3)
+            cons_qty   = c5.number_input("Cantidad recibida", min_value=0.0, value=1.0, step=1.0)
+            cons_unit  = c6.selectbox("Unidad", _CONS_UNITS)
+            exp_date   = c7.date_input(
+                "Fecha de vencimiento *",
+                value=date.today() + timedelta(days=365),
+                min_value=date.today(),
+                help="Fecha impresa en el envase. El sistema alertará 30 días antes.")
+            cons_obs   = st.text_area("Observaciones", placeholder="N° certificado, condiciones de almacenamiento…")
+            sub_cons   = st.form_submit_button("💾 Registrar lote")
+        if sub_cons:
+            if not lot_num.strip() or not cons_name.strip():
+                st.error("N° de lote y nombre son obligatorios.")
+            else:
+                try:
+                    execute(
+                        """INSERT INTO consumable_lots
+                           (lot_number,cons_type,name,brand,quantity,unit,
+                            expiration_date,status,observations,registered_by,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (lot_num.strip(), cons_type, cons_name.strip(),
+                         cons_brand.strip(), cons_qty, cons_unit,
+                         exp_date.isoformat(), "Activo",
+                         cons_obs.strip(), user, datetime.now().isoformat()))
+                    audit(user, "Lote insumo registrado", "Insumos",
+                          f"{cons_type} – Lote {lot_num.strip()} – vence {exp_date.isoformat()}")
+                    st.success(
+                        f"✅ Lote '{lot_num.strip()}' registrado correctamente. "
+                        f"Vence: **{exp_date.isoformat()}**")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Ya existe un lote con ese número para ese tipo de insumo.")
+
+    # ── Tab 2: Inventario ─────────────────────────────────────────────────────
+    with tab_stock:
+        df_c = query_df(
+            "SELECT lot_number, cons_type, name, brand, quantity, unit, "
+            "expiration_date, status, observations, registered_by, created_at "
+            "FROM consumable_lots ORDER BY expiration_date ASC")
+        if df_c.empty:
+            st.info("No hay lotes registrados. Regístralos en la pestaña '➕ Registrar lote'.")
+        else:
+            today_d = date.today()
+
+            def _exp_state(exp_raw):
+                try:
+                    exp  = date.fromisoformat(str(exp_raw))
+                    days = (exp - today_d).days
+                    if days < 0:       return f"🔴 VENCIDO ({abs(days)}d)"
+                    elif days <= 30:   return f"🟡 Vence en {days}d"
+                    else:              return f"🟢 Vigente ({days}d)"
+                except (ValueError, TypeError):
+                    return "❓ Fecha inválida"
+
+            df_show = df_c.copy()
+            df_show["Estado vencimiento"] = df_c["expiration_date"].apply(_exp_state)
+
+            f1, f2 = st.columns(2)
+            ft = f1.selectbox("Tipo", ["Todos"] + _CONS_TYPES, key="cons_ft")
+            fs = f2.selectbox("Estado", ["Todos", "Activo", "Agotado", "Retirado"], key="cons_fs")
+            if ft != "Todos": df_show = df_show[df_show["cons_type"] == ft]
+            if fs != "Todos": df_show = df_show[df_show["status"] == fs]
+
+            n_venc = int(df_show["Estado vencimiento"].str.startswith("🔴").sum())
+            n_prox = int(df_show["Estado vencimiento"].str.startswith("🟡").sum())
+            if n_venc:
+                st.error(f"🔴 {n_venc} lote(s) VENCIDO(S). **No utilizar.** Actualice el estado a 'Retirado'.")
+            if n_prox:
+                st.warning(f"🟡 {n_prox} lote(s) próximos a vencer (≤ 30 días). Planifique reposición.")
+            if not n_venc and not n_prox:
+                st.success("🟢 Todos los lotes visibles están vigentes con más de 30 días.")
+
+            st.dataframe(
+                df_show.rename(columns={
+                    "lot_number": "Lote", "cons_type": "Tipo", "name": "Nombre",
+                    "brand": "Marca", "quantity": "Cantidad", "unit": "Unidad",
+                    "expiration_date": "Vence", "status": "Estado",
+                    "observations": "Observaciones", "registered_by": "Registrado por",
+                    "created_at": "Fecha registro",
+                }),
+                use_container_width=True, hide_index=True,
+                column_order=["Lote", "Tipo", "Nombre", "Marca", "Cantidad", "Unidad",
+                              "Vence", "Estado vencimiento", "Estado", "Observaciones"],
+            )
+
+            # Actualizar estado de un lote
+            st.markdown("---")
+            st.subheader("Actualizar estado de un lote")
+            sel_lots = [f"{r.lot_number} | {r.cons_type}" for _, r in df_c.iterrows()]
+            if sel_lots:
+                with st.form("cons_status_form", clear_on_submit=True):
+                    slc    = st.selectbox("Lote a actualizar", sel_lots, key="cons_slc")
+                    new_st = st.selectbox("Nuevo estado", ["Activo", "Agotado", "Retirado"])
+                    if st.form_submit_button("🔄 Guardar cambio de estado"):
+                        sl_num = slc.split("|")[0].strip()
+                        sl_typ = slc.split("|")[1].strip()
+                        execute(
+                            "UPDATE consumable_lots SET status=? WHERE lot_number=? AND cons_type=?",
+                            (new_st, sl_num, sl_typ))
+                        audit(user, "Estado insumo actualizado", "Insumos",
+                              f"Lote {sl_num} [{sl_typ}] → {new_st}")
+                        st.success(f"Estado del lote '{sl_num}' actualizado a '{new_st}'.")
+                        st.rerun()
+
+    # ── Tab 3: Control de vencimiento ─────────────────────────────────────────
+    with tab_exp:
+        st.subheader("⚠️ Lotes próximos a vencer o vencidos")
+        st.caption(
+            "Alerta automática 30 días antes del vencimiento. "
+            "Referencia: ISO 11607-1:2019 §7.2 / AAMI ST79:2017 §8.3. "
+            "Los lotes vencidos quedan bloqueados en el Registro del proceso."
+        )
+        df_exp = query_df(
+            "SELECT lot_number, cons_type, name, brand, expiration_date, status "
+            "FROM consumable_lots WHERE status='Activo' ORDER BY expiration_date ASC")
+        if df_exp.empty:
+            st.info("No hay lotes activos registrados.")
+        else:
+            today_d2 = date.today()
+            rows_exp  = []
+            for _, r in df_exp.iterrows():
+                try:
+                    exp  = date.fromisoformat(str(r["expiration_date"]))
+                    days = (exp - today_d2).days
+                    if days <= 30:
+                        rows_exp.append({
+                            "🚦": "🔴" if days < 0 else "🟡",
+                            "Lote":   r["lot_number"],
+                            "Tipo":   r["cons_type"],
+                            "Nombre": r["name"],
+                            "Marca":  str(r.get("brand", "")),
+                            "Vence":  str(r["expiration_date"]),
+                            "Días restantes": days,
+                        })
+                except (ValueError, TypeError):
+                    pass
+            if not rows_exp:
+                st.success("🟢 Todos los lotes activos tienen más de 30 días antes del vencimiento.")
+            else:
+                df_exp_show = pd.DataFrame(rows_exp).sort_values("Días restantes")
+                st.dataframe(df_exp_show, use_container_width=True, hide_index=True)
+                n_v = int((df_exp_show["Días restantes"] < 0).sum())
+                n_p = int((df_exp_show["Días restantes"] >= 0).sum())
+                if n_v:
+                    st.error(
+                        f"🔴 {n_v} lote(s) VENCIDO(S). No pueden seleccionarse en el Registro del proceso. "
+                        "Marque el estado como 'Retirado' en la pestaña 'Inventario'.")
+                if n_p:
+                    st.warning(
+                        f"🟡 {n_p} lote(s) vencen en ≤ 30 días. "
+                        "Gestione la reposición antes de que se agoten o venzan.")
+
+        # KPIs de stock
+        st.markdown("---")
+        st.subheader("📊 Resumen de inventario por tipo")
+        df_kpi = query_df(
+            "SELECT cons_type, status, COUNT(*) as n "
+            "FROM consumable_lots GROUP BY cons_type, status ORDER BY cons_type")
+        if not df_kpi.empty:
+            pivot = df_kpi.pivot_table(
+                index="cons_type", columns="status", values="n", aggfunc="sum", fill_value=0
+            ).reset_index()
+            pivot.columns.name = None
+            st.dataframe(pivot.rename(columns={"cons_type": "Tipo de insumo"}),
+                         use_container_width=True, hide_index=True)
+
+
+# ─── Sets quirúrgicos (Mejora W) ─────────────────────────────────────────────
+def surgical_sets_module():
+    """Gestión de sets/bandejas quirúrgicas y reprocesamiento por set completo.
+
+    Referencia: ISO 17664-1:2021 / AAMI ST79:2017 §8.2
+    """
+    st.header("🗂️ Gestión de sets quirúrgicos")
+    st.caption(
+        "Referencia: ISO 17664-1:2021 / AAMI ST79:2017 §8.2 — "
+        "Trazabilidad y reprocesamiento de sets/bandejas de instrumental quirúrgico."
+    )
+    user = st.session_state["user"]
+
+    tab_sets, tab_inst, tab_proc, tab_status = st.tabs([
+        "📝 Sets",
+        "🔧 Instrumental del set",
+        "♻️ Reprocesar set",
+        "📊 Estado del set",
+    ])
+
+    # ── Tab 1: Crear / listar sets ────────────────────────────────────────────
+    with tab_sets:
+        with st.expander("➕ Crear nuevo set quirúrgico", expanded=True):
+            with st.form("set_create_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                set_code = c1.text_input("Código del set *", placeholder="SET-LAP-001",
+                                         help="Código único que identifica el set. Ej: SET-LAP-001, BDJ-ORTO-002")
+                set_name = c2.text_input("Nombre del set *", placeholder="Bandeja de laparoscopia básica")
+                set_desc = st.text_area("Descripción / contenido esperado",
+                                        placeholder="Ej: 5 trócares, 1 pinza grasper, 1 tijera laparoscópica")
+                c3, c4 = st.columns(2)
+                set_srv = c3.text_input("Servicio asignado", placeholder="Cirugía laparoscópica")
+                set_sta = c4.selectbox("Estado inicial", ["Activo", "Inactivo", "En mantenimiento"])
+                sub_s   = st.form_submit_button("💾 Guardar set")
+            if sub_s:
+                if not set_code.strip() or not set_name.strip():
+                    st.error("Código y nombre son obligatorios.")
+                else:
+                    try:
+                        execute(
+                            """INSERT INTO surgical_sets
+                               (set_code,name,description,service,status,registered_by,created_at)
+                               VALUES(?,?,?,?,?,?,?)""",
+                            (set_code.strip(), set_name.strip(), set_desc.strip(),
+                             set_srv.strip(), set_sta, user, datetime.now().isoformat()))
+                        audit(user, "Set creado", "Sets quirúrgicos",
+                              f"Set: {set_code.strip()} – {set_name.strip()}")
+                        st.success(f"✅ Set '{set_code.strip()}' creado correctamente.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Ya existe un set con ese código.")
+
+        st.subheader("📋 Sets registrados")
+        df_sets = query_df(
+            "SELECT ss.set_code, ss.name, ss.service, ss.status, ss.registered_by, "
+            "ss.created_at, COUNT(si.id) as n_instruments "
+            "FROM surgical_sets ss "
+            "LEFT JOIN set_instruments si ON ss.set_code = si.set_code "
+            "GROUP BY ss.set_code ORDER BY ss.created_at DESC")
+        if df_sets.empty:
+            st.info("Aún no hay sets registrados. Créalos con el formulario anterior.")
+        else:
+            def _set_health(scode):
+                """Semáforo de aptitud del set."""
+                df_i = query_df(
+                    "SELECT i.status FROM set_instruments si "
+                    "JOIN instruments i ON si.instrument_code = i.code "
+                    "WHERE si.set_code=?", (scode,))
+                if df_i.empty:
+                    return "⚪ Sin instrumentos"
+                bad = df_i[df_i["status"].isin(["Dañado", "Retirado", "En mantenimiento"])]
+                if not bad.empty:
+                    return f"🔴 {len(bad)} instrumento(s) no apto(s)"
+                return "🟢 Todos aptos"
+
+            df_sets["Aptitud del set"] = df_sets["set_code"].apply(_set_health)
+            st.dataframe(
+                df_sets.rename(columns={
+                    "set_code":      "Código",
+                    "name":          "Nombre",
+                    "service":       "Servicio",
+                    "status":        "Estado",
+                    "n_instruments": "N° instrumentos",
+                    "registered_by": "Registrado por",
+                    "created_at":    "Fecha creación",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_order=["Código", "Nombre", "Servicio", "Estado",
+                              "N° instrumentos", "Aptitud del set",
+                              "Registrado por", "Fecha creación"],
+            )
+            n_problemas = df_sets["Aptitud del set"].str.startswith("🔴").sum()
+            if n_problemas:
+                st.error(f"🔴 {n_problemas} set(s) con instrumentos no aptos. Revise la pestaña '📊 Estado del set'.")
+
+    # ── Tab 2: Gestión de instrumentos dentro del set ─────────────────────────
+    with tab_inst:
+        df_all_sets = query_df(
+            "SELECT set_code, name FROM surgical_sets WHERE status='Activo' ORDER BY set_code")
+        if df_all_sets.empty:
+            st.warning("No hay sets activos. Crea primero un set en la pestaña '📝 Sets'.")
+        else:
+            sel_set = st.selectbox(
+                "Set quirúrgico",
+                [f"{r.set_code} – {r['name']}" for _, r in df_all_sets.iterrows()],
+                key="si_set_sel")
+            sel_set_code = sel_set.split("–")[0].strip()
+
+            df_in_set = query_df(
+                "SELECT si.instrument_code, i.name, i.category, i.spaulding, "
+                "i.status as estado_ins, si.position, si.notes "
+                "FROM set_instruments si "
+                "JOIN instruments i ON si.instrument_code = i.code "
+                "WHERE si.set_code=? ORDER BY si.position, si.instrument_code",
+                (sel_set_code,))
+
+            st.subheader(f"Instrumentos en set '{sel_set_code}'")
+            if df_in_set.empty:
+                st.info("Este set aún no tiene instrumentos asignados.")
+            else:
+                bad_ins = df_in_set[df_in_set["estado_ins"].isin(["Dañado", "Retirado", "En mantenimiento"])]
+                if not bad_ins.empty:
+                    st.error(
+                        f"⚠️ {len(bad_ins)} instrumento(s) NO APTOS en este set: "
+                        + ", ".join(bad_ins["instrument_code"].tolist())
+                        + " — Corrija el estado antes de reprocesar el set completo."
+                    )
+                df_show = df_in_set.copy()
+                df_show["🚦"] = df_show["estado_ins"].apply(
+                    lambda e: "🟢" if e == "Activo" else ("🟡" if e == "En mantenimiento" else "🔴"))
+                st.dataframe(
+                    df_show[["🚦", "instrument_code", "name", "category",
+                              "spaulding", "estado_ins", "position", "notes"]].rename(columns={
+                        "instrument_code": "Código", "name": "Nombre",
+                        "category": "Categoría", "spaulding": "Spaulding",
+                        "estado_ins": "Estado", "position": "Posición", "notes": "Notas",
+                    }),
+                    use_container_width=True, hide_index=True)
+
+                st.markdown("**Retirar instrumento del set**")
+                opts_del = [f"{r.instrument_code} – {r['name']}" for _, r in df_in_set.iterrows()]
+                del_sel  = st.selectbox("Instrumento a retirar", opts_del, key="si_del_sel")
+                if st.button("🗑️ Retirar del set", key="si_del_btn"):
+                    del_code = del_sel.split("–")[0].strip()
+                    execute("DELETE FROM set_instruments WHERE set_code=? AND instrument_code=?",
+                            (sel_set_code, del_code))
+                    audit(user, "Instrumento retirado de set", "Sets quirúrgicos",
+                          f"Set {sel_set_code} – instrumento {del_code}")
+                    st.success(f"Instrumento '{del_code}' retirado del set '{sel_set_code}'.")
+                    st.rerun()
+
+            st.markdown("---")
+            already = set(df_in_set["instrument_code"].tolist()) if not df_in_set.empty else set()
+            ins_all = query_df("SELECT code, name, status FROM instruments ORDER BY code")
+            avail   = ins_all[~ins_all["code"].isin(already)] if not ins_all.empty else ins_all
+            if ins_all.empty:
+                st.warning("No hay instrumental registrado. Regístrelo primero en '🔧 Registro de instrumental'.")
+            elif avail.empty:
+                st.info("Todos los instrumentos registrados ya están en este set.")
+            else:
+                st.subheader("➕ Agregar instrumento al set")
+                with st.form("si_add_form", clear_on_submit=True):
+                    add_opts = [f"{r.code} – {r['name']} [{r.status}]" for _, r in avail.iterrows()]
+                    add_sel  = st.selectbox("Instrumental *", add_opts)
+                    add_pos  = st.number_input("Posición en el set", min_value=1,
+                                               value=len(df_in_set) + 1)
+                    add_note = st.text_input("Notas",
+                                             placeholder="Ej: instrumento principal, verificar lubricación")
+                    sub_add  = st.form_submit_button("➕ Agregar")
+                if sub_add:
+                    add_code = add_sel.split("–")[0].strip()
+                    try:
+                        execute(
+                            """INSERT INTO set_instruments
+                               (set_code,instrument_code,position,notes,added_by,created_at)
+                               VALUES(?,?,?,?,?,?)""",
+                            (sel_set_code, add_code, int(add_pos),
+                             add_note.strip(), user, datetime.now().isoformat()))
+                        audit(user, "Instrumento añadido a set", "Sets quirúrgicos",
+                              f"Set {sel_set_code} ← instrumento {add_code}")
+                        st.success(f"✅ '{add_code}' agregado al set '{sel_set_code}'.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Ese instrumento ya está en el set.")
+
+    # ── Tab 3: Reprocesar el set completo ──────────────────────────────────────
+    with tab_proc:
+        st.subheader("♻️ Registrar reprocesamiento de set completo")
+        st.info(
+            "💡 Se creará un registro de proceso para **cada instrumento** del set con la "
+            "misma etapa y lote. Referencia: ISO 17664-1:2021 / AAMI ST79:2017 §8.2."
+        )
+        df_sets2 = query_df(
+            "SELECT set_code, name FROM surgical_sets WHERE status='Activo' ORDER BY set_code")
+        if df_sets2.empty:
+            st.warning("No hay sets activos registrados.")
+        else:
+            sp1, sp2 = st.columns(2)
+            sel_set2  = sp1.selectbox(
+                "Set quirúrgico",
+                [f"{r.set_code} – {r['name']}" for _, r in df_sets2.iterrows()],
+                key="sp_set_sel")
+            sel_code2 = sel_set2.split("–")[0].strip()
+
+            df_set_ins = query_df(
+                "SELECT si.instrument_code, i.name, i.status as estado_ins "
+                "FROM set_instruments si "
+                "JOIN instruments i ON si.instrument_code = i.code "
+                "WHERE si.set_code=? ORDER BY si.position, si.instrument_code",
+                (sel_code2,))
+
+            if df_set_ins.empty:
+                st.warning("Este set no tiene instrumentos. Agréguelos en '🔧 Instrumental del set'.")
+            else:
+                bad_proc = df_set_ins[df_set_ins["estado_ins"].isin(["Dañado", "Retirado"])]
+                if not bad_proc.empty:
+                    st.error(
+                        f"🔴 BLOQUEO (ISO 17664-1:2021): {len(bad_proc)} instrumento(s) en estado "
+                        f"**Dañado/Retirado** — {', '.join(bad_proc['instrument_code'].tolist())}. "
+                        "No se puede registrar el reprocesamiento mientras el set tenga instrumentos "
+                        "en estado no apto. Corrija el estado del instrumental primero."
+                    )
+                else:
+                    stage_s = sp2.selectbox("Etapa *", STAGES, key="sp_stage")
+                    st.caption(f"Set: **{sel_code2}** · {len(df_set_ins)} instrumento(s)")
+                    st.dataframe(
+                        df_set_ins.rename(columns={
+                            "instrument_code": "Código", "name": "Nombre",
+                            "estado_ins": "Estado"}),
+                        use_container_width=True, hide_index=True)
+
+                    with st.form("sp_form", clear_on_submit=True):
+                        batch_s  = st.text_input("Lote del set *",
+                                                 placeholder="SET-LAP-2026-001",
+                                                 help=BATCH_HINT)
+                        st.caption(f"ℹ️ {BATCH_HINT}")
+                        resp_s   = st.text_input("Responsable *", value=user)
+                        comp_s   = st.radio("¿Cumple protocolo?", ["Sí", "No"], horizontal=True)
+                        result_s = st.selectbox("Resultado",
+                                                ["Aprobado", "Rechazado", "Pendiente", "No aplica"])
+                        obs_s    = st.text_area("Observaciones del set / lote")
+                        pc1, pc2, pc3, pc4 = st.columns(4)
+                        sd_s  = pc1.date_input("Fecha inicio", value=date.today())
+                        st_s  = pc2.time_input("Hora inicio")
+                        ed_s  = pc3.date_input("Fecha fin",   value=date.today())
+                        et_s  = pc4.time_input("Hora fin")
+                        sub_p = st.form_submit_button("♻️ Registrar reprocesamiento del set")
+
+                    if sub_p:
+                        if not batch_s.strip():
+                            st.error("El lote es obligatorio.")
+                        elif not BATCH_PATTERN.match(batch_s.strip()):
+                            st.error(f"Formato de lote inválido. {BATCH_HINT}")
+                        elif not resp_s.strip():
+                            st.error("El responsable es obligatorio.")
+                        else:
+                            start_dt = datetime.combine(sd_s, st_s).isoformat()
+                            end_dt   = datetime.combine(ed_s, et_s).isoformat()
+                            try:
+                                dur = (datetime.combine(ed_s, et_s)
+                                       - datetime.combine(sd_s, st_s)).total_seconds() / 60
+                            except Exception:
+                                dur = 0.0
+                            n_ok = 0; n_warn = 0
+                            for _, ins_row in df_set_ins.iterrows():
+                                ins_code = ins_row["instrument_code"]
+                                ok_seq, msg_seq = validate_stage_order(
+                                    ins_code, batch_s.strip(), stage_s)
+                                if not ok_seq:
+                                    st.warning(f"⚠️ {ins_code}: {msg_seq}")
+                                    n_warn += 1
+                                    continue
+                                try:
+                                    execute(
+                                        """INSERT INTO process_records
+                                           (instrument_code,batch_code,stage,responsible,
+                                            start_datetime,end_datetime,duration_minutes,
+                                            complies,result,observations,registered_by,created_at)
+                                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        (ins_code, batch_s.strip(), stage_s,
+                                         resp_s.strip(), start_dt, end_dt,
+                                         round(dur, 2), comp_s, result_s,
+                                         obs_s.strip(), user, datetime.now().isoformat()))
+                                    if result_s == "Rechazado":
+                                        add_alert(ins_code, batch_s.strip(),
+                                                  "Ciclo rechazado", "Alta",
+                                                  f"Set {sel_code2} – etapa '{stage_s}' rechazada.")
+                                    n_ok += 1
+                                except Exception as _exc:
+                                    st.warning(f"⚠️ Error al registrar '{ins_code}': {_exc}")
+                                    n_warn += 1
+                            if n_ok:
+                                audit(user, "Reprocesamiento de set", "Sets quirúrgicos",
+                                      f"Set {sel_code2} – Lote {batch_s.strip()} "
+                                      f"– Etapa '{stage_s}' – {n_ok} instrumento(s)")
+                                st.success(
+                                    f"✅ {n_ok} instrumento(s) del set '{sel_code2}' "
+                                    f"registrados en etapa '{stage_s}'.")
+                            if n_warn:
+                                st.warning(
+                                    f"⚠️ {n_warn} instrumento(s) omitidos por "
+                                    "secuencia inválida o error.")
+                            if n_ok:
+                                st.rerun()
+
+    # ── Tab 4: Estado detallado del set ───────────────────────────────────────
+    with tab_status:
+        st.subheader("📊 Estado detallado por set")
+        df_sets3 = query_df(
+            "SELECT set_code, name FROM surgical_sets ORDER BY set_code")
+        if df_sets3.empty:
+            st.info("No hay sets registrados.")
+        else:
+            sel_set3  = st.selectbox(
+                "Seleccionar set",
+                [f"{r.set_code} – {r['name']}" for _, r in df_sets3.iterrows()],
+                key="sst_sel")
+            sel_code3 = sel_set3.split("–")[0].strip()
+
+            df_det = query_df(
+                "SELECT si.instrument_code, i.name, i.category, i.spaulding, "
+                "i.status as estado_ins, si.position, si.notes "
+                "FROM set_instruments si "
+                "JOIN instruments i ON si.instrument_code = i.code "
+                "WHERE si.set_code=? ORDER BY si.position, si.instrument_code",
+                (sel_code3,))
+
+            if df_det.empty:
+                st.info("Este set no tiene instrumentos asignados.")
+            else:
+                n_total = len(df_det)
+                n_aptos = int((df_det["estado_ins"] == "Activo").sum())
+                n_malos = n_total - n_aptos
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total instrumentos", n_total)
+                m2.metric("Aptos", n_aptos)
+                m3.metric("No aptos", n_malos, delta_color="inverse")
+
+                if n_malos:
+                    st.error(
+                        f"⚠️ {n_malos} instrumento(s) NO APTOS para el reprocesamiento del set. "
+                        "Revise y corrija el estado antes de iniciar la ruta de reprocesamiento. "
+                        "(ISO 17664-1:2021 / AAMI ST79:2017 §8.2)"
+                    )
+                    mal_list = df_det[df_det["estado_ins"] != "Activo"][
+                        ["instrument_code", "name", "estado_ins"]].rename(columns={
+                        "instrument_code": "Código", "name": "Nombre", "estado_ins": "Estado"})
+                    st.dataframe(mal_list, use_container_width=True, hide_index=True)
+                else:
+                    st.success(f"🟢 Todos los {n_total} instrumentos están ACTIVOS y aptos.")
+
+                df_det["🚦"] = df_det["estado_ins"].apply(
+                    lambda e: "🟢" if e == "Activo" else ("🟡" if e == "En mantenimiento" else "🔴"))
+                st.dataframe(
+                    df_det[["🚦", "instrument_code", "name", "category",
+                             "spaulding", "estado_ins", "position", "notes"]].rename(columns={
+                        "instrument_code": "Código", "name": "Nombre",
+                        "category": "Categoría", "spaulding": "Spaulding",
+                        "estado_ins": "Estado", "position": "Posición", "notes": "Notas",
+                    }),
+                    use_container_width=True, hide_index=True)
+
+                # Últimos lotes registrados para los instrumentos del set
+                st.markdown("---")
+                st.subheader("Historial de reprocesamiento del set")
+                codes = df_det["instrument_code"].tolist()
+                ph    = ",".join(["?"] * len(codes))
+                df_hist = query_df(
+                    f"SELECT instrument_code, batch_code, stage, result, "
+                    f"complies, responsible, created_at "
+                    f"FROM process_records WHERE instrument_code IN ({ph}) "
+                    f"ORDER BY created_at DESC LIMIT 60",
+                    tuple(codes))
+                if df_hist.empty:
+                    st.info("Sin registros de proceso para los instrumentos de este set.")
+                else:
+                    st.dataframe(
+                        df_hist.rename(columns={
+                            "instrument_code": "Código", "batch_code": "Lote",
+                            "stage": "Etapa", "result": "Resultado",
+                            "complies": "Cumple", "responsible": "Responsable",
+                            "created_at": "Fecha"}),
+                        use_container_width=True, hide_index=True)
+
+
+# ─── Mantenimiento de equipos (Mejora Z) ─────────────────────────────────────
+
+_MAINT_TYPES = ["Preventivo", "Correctivo", "Predictivo", "Verificación de rendimiento"]
+_MAINT_RESULTS = ["Conforme", "No conforme", "Pendiente revisión"]
+
+
+def _check_maintenance_alerts() -> None:
+    """Genera alertas automáticas para mantenimientos vencidos o próximos.
+
+    Idempotente: no genera duplicados para el mismo equipo en el mismo día.
+    Referencia: ISO 17665-1:2006 §10.4 / AAMI ST79:2017 §12.3.
+    """
+    today = date.today()
+    warn_horizon = today + timedelta(days=30)
+    df = query_df(
+        "SELECT equipment_id, equipment_name, next_maintenance_date, maintenance_type "
+        "FROM equipment_maintenance "
+        "WHERE next_maintenance_date IS NOT NULL AND next_maintenance_date != '' "
+        "ORDER BY equipment_id, next_maintenance_date DESC"
+    )
+    if df.empty:
+        return
+
+    # Solo el registro más reciente por equipo (la próxima fecha programada)
+    seen: set = set()
+    for _, row in df.iterrows():
+        eid = str(row["equipment_id"])
+        if eid in seen:
+            continue
+        seen.add(eid)
+        try:
+            nxt = date.fromisoformat(str(row["next_maintenance_date"]))
+        except (ValueError, TypeError):
+            continue
+        days_left = (nxt - today).days
+
+        if days_left < 0:
+            sev, msg = "Alta", (
+                f"Mantenimiento VENCIDO hace {abs(days_left)} día(s): "
+                f"{row['equipment_name']} ({eid}) — tipo: {row['maintenance_type']}. "
+                f"Programado: {nxt.isoformat()}. Ref: AAMI ST79:2017 §12.3."
+            )
+        elif days_left <= 30:
+            sev, msg = "Media", (
+                f"Mantenimiento próximo en {days_left} día(s): "
+                f"{row['equipment_name']} ({eid}) — tipo: {row['maintenance_type']}. "
+                f"Programado: {nxt.isoformat()}. Ref: ISO 17665-1:2006 §10.4."
+            )
+        else:
+            continue
+
+        # Verificar si ya existe alerta abierta para este equipo con este vencimiento
+        existing = query_df(
+            "SELECT id FROM alerts "
+            "WHERE instrument_code=? AND alert_type='Mantenimiento de equipo' "
+            "AND status='Abierta' AND batch_code=?",
+            (eid, nxt.isoformat())
+        )
+        if existing.empty:
+            execute(
+                "INSERT INTO alerts "
+                "(instrument_code, batch_code, alert_type, description, severity, status, created_by, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (eid, nxt.isoformat(), "Mantenimiento de equipo", msg,
+                 sev, "Abierta", "Sistema", datetime.now().isoformat())
+            )
+
+
+def maintenance_module():
+    """Registro de mantenimiento preventivo y correctivo de equipos.
+
+    Referencia: ISO 17665-1:2006 §10.4 / AAMI ST79:2017 §12.3
+    Complementa el módulo de Calibración (🔩).
+    """
+    st.header("🛠️ Mantenimiento de equipos")
+    st.caption(
+        "Referencia: ISO 17665-1:2006 §10.4 / AAMI ST79:2017 §12.3 — "
+        "Programa de mantenimiento preventivo y correctivo. "
+        "Complementa el módulo 🔩 Calibración de equipos."
+    )
+
+    _check_maintenance_alerts()
+    user = st.session_state["user"]
+
+    tab_reg, tab_hist, tab_estado = st.tabs([
+        "➕ Registrar mantenimiento",
+        "📋 Historial por equipo",
+        "🚦 Estado de equipos",
+    ])
+
+    # ── Tab 1: Registro ───────────────────────────────────────────────────────
+    with tab_reg:
+        st.subheader("Registrar mantenimiento")
+
+        # Pre-llenar equipo desde calibración si existe
+        eq_options_df = query_df(
+            "SELECT DISTINCT equipment_id, equipment_name FROM equipment_calibration ORDER BY equipment_id"
+        )
+        eq_options = ["(nuevo equipo)"] + [
+            f"{r['equipment_id']} — {r['equipment_name']}"
+            for _, r in eq_options_df.iterrows()
+        ] if not eq_options_df.empty else ["(nuevo equipo)"]
+
+        sel_eq = st.selectbox(
+            "Seleccionar equipo existente (desde Calibración) o ingresar manualmente",
+            eq_options,
+            help="Los equipos registrados en Calibración aparecen aquí automáticamente.",
+        )
+
+        with st.form("maint_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            if sel_eq == "(nuevo equipo)":
+                eq_id   = c1.text_input("ID del equipo *", placeholder="EST-01")
+                eq_name = c2.text_input("Nombre del equipo *", placeholder="Autoclave de vapor 134°C")
+            else:
+                parts   = sel_eq.split(" — ", 1)
+                eq_id   = c1.text_input("ID del equipo *", value=parts[0].strip())
+                eq_name = c2.text_input("Nombre del equipo *",
+                                        value=parts[1].strip() if len(parts) > 1 else "")
+
+            c3, c4 = st.columns(2)
+            maint_type   = c3.selectbox("Tipo de mantenimiento *", _MAINT_TYPES)
+            maint_result = c4.selectbox("Resultado", _MAINT_RESULTS)
+
+            c5, c6 = st.columns(2)
+            maint_date = c5.date_input("Fecha de realización *", value=date.today())
+            next_maint = c6.date_input(
+                "Próxima fecha programada",
+                value=date.today() + timedelta(days=180),
+                min_value=date.today(),
+                help="Dejar en el valor por defecto si no hay próxima fecha programada aún.",
+            )
+
+            c7, c8 = st.columns(2)
+            technician = c7.text_input("Técnico responsable", placeholder="Ing. García")
+            supplier   = c8.text_input("Proveedor / empresa", placeholder="TechService S.A.S.")
+
+            c9, c10 = st.columns(2)
+            work_order = c9.text_input("Orden de trabajo / N° informe", placeholder="OT-2026-001")
+            cost       = c10.number_input("Costo (COP $)", min_value=0.0, step=1000.0, value=0.0)
+
+            work_desc = st.text_area(
+                "Descripción del trabajo realizado *",
+                placeholder="Describa detalladamente las actividades ejecutadas, piezas reemplazadas, pruebas realizadas…",
+                height=120,
+            )
+            obs = st.text_area("Observaciones / recomendaciones", height=70)
+
+            submitted = st.form_submit_button("💾 Guardar mantenimiento")
+
+        if submitted:
+            errors: list = []
+            if not eq_id.strip():   errors.append("El ID del equipo es obligatorio.")
+            if not eq_name.strip(): errors.append("El nombre del equipo es obligatorio.")
+            if not work_desc.strip(): errors.append("La descripción del trabajo es obligatoria.")
+            if next_maint <= maint_date:
+                errors.append("La próxima fecha debe ser posterior a la fecha de realización.")
+            if errors:
+                for e in errors: st.error(e)
+            else:
+                execute(
+                    """INSERT INTO equipment_maintenance
+                       (equipment_id, equipment_name, maintenance_type, maintenance_date,
+                        technician, supplier, work_description, next_maintenance_date,
+                        cost, work_order, result, observations, registered_by, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (eq_id.strip(), eq_name.strip(), maint_type,
+                     maint_date.isoformat(), technician.strip(), supplier.strip(),
+                     work_desc.strip(), next_maint.isoformat(),
+                     cost if cost > 0 else None,
+                     work_order.strip() or None,
+                     maint_result, obs.strip() or None,
+                     user, datetime.now().isoformat()),
+                )
+                audit(user, "Mantenimiento registrado", "Mantenimiento",
+                      f"Equipo {eq_id.strip()} — {maint_type} — próximo: {next_maint.isoformat()}")
+                # Cerrar alerta abierta de mantenimiento vencido para este equipo
+                execute(
+                    "UPDATE alerts SET status='Cerrada', closing_reason=? "
+                    "WHERE instrument_code=? AND alert_type='Mantenimiento de equipo' AND status='Abierta'",
+                    (f"Mantenimiento realizado el {maint_date.isoformat()} por {user}.", eq_id.strip()),
+                )
+                st.success(
+                    f"✅ Mantenimiento registrado para **{eq_name.strip()}**. "
+                    f"Próxima fecha: **{next_maint.isoformat()}**."
+                )
+                st.rerun()
+
+    # ── Tab 2: Historial por equipo ───────────────────────────────────────────
+    with tab_hist:
+        st.subheader("Historial de mantenimientos")
+
+        df_all = query_df(
+            "SELECT equipment_id, equipment_name, maintenance_type, maintenance_date, "
+            "technician, supplier, work_description, next_maintenance_date, "
+            "cost, work_order, result, observations, registered_by, created_at "
+            "FROM equipment_maintenance ORDER BY maintenance_date DESC"
+        )
+
+        if df_all.empty:
+            st.info("No hay registros de mantenimiento. Usa la pestaña '➕ Registrar mantenimiento'.")
+        else:
+            # Filtros
+            f1, f2, f3 = st.columns(3)
+            eq_filter   = f1.text_input("🔍 Filtrar por equipo (ID o nombre)", key="mh_eq")
+            type_filter = f2.selectbox("Tipo", ["Todos"] + _MAINT_TYPES, key="mh_type")
+            res_filter  = f3.selectbox("Resultado", ["Todos"] + _MAINT_RESULTS, key="mh_res")
+
+            df_show = df_all.copy()
+            if eq_filter:
+                mask = (
+                    df_show["equipment_id"].str.contains(eq_filter, case=False, na=False) |
+                    df_show["equipment_name"].str.contains(eq_filter, case=False, na=False)
+                )
+                df_show = df_show[mask]
+            if type_filter != "Todos":
+                df_show = df_show[df_show["maintenance_type"] == type_filter]
+            if res_filter != "Todos":
+                df_show = df_show[df_show["result"] == res_filter]
+
+            st.dataframe(
+                df_show.rename(columns={
+                    "equipment_id":           "ID Equipo",
+                    "equipment_name":         "Nombre",
+                    "maintenance_type":       "Tipo",
+                    "maintenance_date":       "Fecha realización",
+                    "technician":             "Técnico",
+                    "supplier":               "Proveedor",
+                    "work_description":       "Trabajo realizado",
+                    "next_maintenance_date":  "Próximo mantenimiento",
+                    "cost":                   "Costo (COP $)",
+                    "work_order":             "Orden trabajo",
+                    "result":                 "Resultado",
+                    "observations":           "Observaciones",
+                    "registered_by":          "Registrado por",
+                    "created_at":             "Registrado en",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_order=[
+                    "ID Equipo", "Nombre", "Tipo", "Fecha realización",
+                    "Próximo mantenimiento", "Resultado", "Técnico", "Proveedor",
+                    "Orden trabajo", "Costo (COP $)", "Trabajo realizado", "Observaciones",
+                ],
+            )
+
+            # KPIs rápidos
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total registros", len(df_show))
+            k2.metric("Preventivos", int((df_show["maintenance_type"] == "Preventivo").sum()))
+            k3.metric("Correctivos", int((df_show["maintenance_type"] == "Correctivo").sum()))
+            nc_res = int((df_show["result"] == "No conforme").sum())
+            k4.metric("No conformes", nc_res, delta=f"{nc_res} requieren acción",
+                      delta_color="inverse" if nc_res else "off")
+
+            # Exportar
+            buf_m = io.BytesIO()
+            with pd.ExcelWriter(buf_m, engine="openpyxl") as _wr:
+                df_show.to_excel(_wr, index=False, sheet_name="Mantenimiento equipos")
+            st.download_button(
+                "📥 Exportar historial (Excel)",
+                data=buf_m.getvalue(),
+                file_name=f"mantenimiento_equipos_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    # ── Tab 3: Estado de equipos (semáforo) ───────────────────────────────────
+    with tab_estado:
+        st.subheader("Estado de mantenimiento por equipo")
+        st.caption(
+            "Semáforo: 🟢 Vigente (> 30 días) · 🟡 Próximo (≤ 30 días) · 🔴 Vencido. "
+            "Basado en el registro de mantenimiento más reciente con próxima fecha programada."
+        )
+
+        df_eq = query_df(
+            "SELECT equipment_id, equipment_name, maintenance_type, "
+            "maintenance_date, next_maintenance_date, result, technician "
+            "FROM equipment_maintenance "
+            "WHERE next_maintenance_date IS NOT NULL AND next_maintenance_date != '' "
+            "ORDER BY equipment_id, next_maintenance_date DESC"
+        )
+
+        if df_eq.empty:
+            st.info("No hay equipos con mantenimiento programado registrado.")
+        else:
+            today_s = date.today()
+
+            # Un registro por equipo — el más reciente (ya ordenado DESC)
+            df_latest = df_eq.drop_duplicates(subset=["equipment_id"], keep="first").copy()
+
+            def _maint_estado(nxt_raw):
+                try:
+                    nxt = date.fromisoformat(str(nxt_raw))
+                    d = (nxt - today_s).days
+                    if d < 0:      return f"🔴 Vencido ({abs(d)} días)"
+                    elif d <= 30:  return f"🟡 Vence en {d} días"
+                    else:          return f"🟢 Vigente ({d} días)"
+                except (ValueError, TypeError):
+                    return "❓ Fecha inválida"
+
+            df_latest["Estado"] = df_latest["next_maintenance_date"].apply(_maint_estado)
+
+            # Resumen ejecutivo
+            n_total  = len(df_latest)
+            n_venc   = int(df_latest["Estado"].str.startswith("🔴").sum())
+            n_prox   = int(df_latest["Estado"].str.startswith("🟡").sum())
+            n_ok     = n_total - n_venc - n_prox
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Equipos registrados", n_total)
+            m2.metric("🟢 Vigentes", n_ok)
+            m3.metric("🟡 Próximos (≤30 días)", n_prox,
+                      delta="Programar mantenimiento" if n_prox else None, delta_color="inverse")
+            m4.metric("🔴 Vencidos", n_venc,
+                      delta="Acción inmediata" if n_venc else None, delta_color="inverse")
+
+            st.dataframe(
+                df_latest.rename(columns={
+                    "equipment_id":          "ID Equipo",
+                    "equipment_name":        "Nombre",
+                    "maintenance_type":      "Último tipo",
+                    "maintenance_date":      "Último mantenimiento",
+                    "next_maintenance_date": "Próxima fecha",
+                    "result":                "Resultado",
+                    "technician":            "Técnico",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_order=[
+                    "ID Equipo", "Nombre", "Estado", "Último tipo",
+                    "Último mantenimiento", "Próxima fecha", "Resultado", "Técnico",
+                ],
+            )
+
+            # Alertas visuales
+            if n_venc:
+                venc_list = df_latest[df_latest["Estado"].str.startswith("🔴")]
+                st.error(
+                    f"🔴 **{n_venc} equipo(s) con mantenimiento vencido** — "
+                    "Suspender uso hasta realizar mantenimiento (AAMI ST79:2017 §12.3):\n" +
+                    "\n".join(
+                        f"- **{r['equipment_id']}** {r['equipment_name']} "
+                        f"— vencido: {r['next_maintenance_date']}"
+                        for _, r in venc_list.iterrows()
+                    )
+                )
+            if n_prox:
+                prox_list = df_latest[df_latest["Estado"].str.startswith("🟡")]
+                st.warning(
+                    f"🟡 **{n_prox} equipo(s) con mantenimiento próximo** "
+                    f"(≤ 30 días) — ISO 17665-1:2006 §10.4:\n" +
+                    "\n".join(
+                        f"- **{r['equipment_id']}** {r['equipment_name']} "
+                        f"— programado: {r['next_maintenance_date']}"
+                        for _, r in prox_list.iterrows()
+                    )
+                )
+            if not n_venc and not n_prox:
+                st.success("🟢 Todos los equipos tienen mantenimiento vigente.")
+
+            # Gráfico de distribución por tipo
+            plt_m = _get_plt()
+            hist_df = query_df(
+                "SELECT maintenance_type, COUNT(*) as n FROM equipment_maintenance GROUP BY maintenance_type"
+            )
+            if not hist_df.empty:
+                fig_m, ax_m = plt_m.subplots(figsize=(6, 3))
+                ax_m.barh(hist_df["maintenance_type"], hist_df["n"],
+                          color=["#2ca02c", "#d62728", "#ff7f0e", "#1f77b4"])
+                ax_m.set_xlabel("Cantidad de registros")
+                ax_m.set_title("Mantenimientos registrados por tipo")
+                for i, v in enumerate(hist_df["n"]):
+                    ax_m.text(v + 0.05, i, str(v), va="center", fontsize=9)
+                fig_m.tight_layout()
+                st.pyplot(fig_m)
+                plt_m.close(fig_m)
+
+
+# ─── Scorecard de cumplimiento normativo (Mejora Y) ───────────────────────────
+
+# Pesos por indicador dentro de cada norma (deben sumar 1.0)
+_SC_WEIGHTS: dict = {
+    "AAMI ST79": {
+        "Trazabilidad completa (8 etapas)":  0.30,
+        "Tiempo mínimo por etapa":            0.20,
+        "Parámetros programados conformes":   0.20,
+        "Doble verificación en liberación":   0.15,
+        "Cumplimiento de protocolo":          0.15,
+    },
+    "ISO 17665 / EN 285": {
+        "Temperatura real conforme":          0.35,
+        "Presión real conforme":              0.30,
+        "Exposición real conforme":           0.35,
+    },
+    "ISO 15883": {
+        "Limpieza conforme":                  1.00,
+    },
+    "ISO 13485 §9": {
+        "Alertas Alta cerradas":              0.35,
+        "NC cerradas":                        0.35,
+        "Sin recalls activos":                0.30,
+    },
+    "Res. 4816/2008": {
+        "Tasa de rechazo ≤ 5 %":             0.30,
+        "Insumos vigentes":                   0.25,
+        "Equipos calibrados":                 0.25,
+        "IB sin positivos":                   0.20,
+    },
+}
+
+
+def _compute_scorecard() -> dict:
+    """Calcula indicadores de cumplimiento normativo desde los registros reales.
+
+    Devuelve dict: norma → {
+        "score": float (0-100),
+        "indicators": {nombre: {"pct": float, "n_ok": int, "n_total": int, "weight": float}},
+        "weight_sum": float,
+    }
+    Referencia: ISO 13485:2016 §9 — seguimiento, medición, análisis y evaluación.
+    """
+    today = date.today()
+    rec   = query_df("SELECT stage, complies, result, duration_minutes, cycle_type, "
+                     "temperature, pressure, exposure_time, "
+                     "actual_temperature, actual_pressure, actual_exposure_time, "
+                     "cleaning_complies, release_supervisor, instrument_code, batch_code "
+                     "FROM process_records")
+    alerts_df    = query_df("SELECT severity, status, alert_type FROM alerts")
+    nc_df        = query_df("SELECT status FROM nonconformities")
+    recalls_df   = query_df("SELECT status FROM recall_events")
+    cal_df       = query_df("SELECT equipment_id, next_calibration_date FROM equipment_calibration")
+    cons_df      = query_df("SELECT expiration_date, status FROM consumable_lots")
+    bi_df        = query_df("SELECT result FROM biological_indicators")
+
+    result: dict = {}
+
+    # ── AAMI ST79:2017 ────────────────────────────────────────────────────────
+    ind_aami: dict = {}
+
+    # 1. Trazabilidad completa (lotes con las 8 etapas)
+    if not rec.empty:
+        lotes = rec.groupby(["instrument_code", "batch_code"])["stage"].apply(set)
+        n_total = len(lotes)
+        n_ok    = int(lotes.apply(lambda s: set(STAGES).issubset(s)).sum())
+    else:
+        n_total = 0; n_ok = 0
+    ind_aami["Trazabilidad completa (8 etapas)"] = {
+        "pct": round(n_ok / n_total * 100, 1) if n_total else 100.0,
+        "n_ok": n_ok, "n_total": n_total,
+        "weight": _SC_WEIGHTS["AAMI ST79"]["Trazabilidad completa (8 etapas)"],
+        "tooltip": "% de pares instrumento/lote con las 8 etapas completas.",
+    }
+
+    # 2. Tiempo mínimo por etapa
+    if not rec.empty:
+        dur_rows = rec.dropna(subset=["duration_minutes"])
+        dur_rows = dur_rows[dur_rows["stage"].isin(STAGE_MIN_DURATION)]
+        n_tot_d = len(dur_rows)
+        if n_tot_d:
+            ok_mask = dur_rows.apply(
+                lambda r: float(r["duration_minutes"]) >= STAGE_MIN_DURATION.get(r["stage"], 0),
+                axis=1)
+            n_ok_d = int(ok_mask.sum())
+        else:
+            n_ok_d = 0
+    else:
+        n_tot_d = 0; n_ok_d = 0
+    ind_aami["Tiempo mínimo por etapa"] = {
+        "pct": round(n_ok_d / n_tot_d * 100, 1) if n_tot_d else 100.0,
+        "n_ok": n_ok_d, "n_total": n_tot_d,
+        "weight": _SC_WEIGHTS["AAMI ST79"]["Tiempo mínimo por etapa"],
+        "tooltip": "% de registros donde la duración ≥ mínimo normativo (AAMI ST79 / ISO 15883).",
+    }
+
+    # 3. Parámetros programados conformes (esterilización)
+    est = rec[rec["stage"] == "Esterilización"].copy() if not rec.empty else rec
+    est_eval = est.dropna(subset=["cycle_type"]) if not est.empty else est
+    n_est = len(est_eval)
+    if n_est:
+        def _prog_ok(r):
+            ct = r["cycle_type"]
+            min_t = STERIL_MIN_TEMP.get(ct)
+            min_p = STERIL_MIN_PRESSURE.get(ct)
+            min_e = STERIL_MIN_EXPOSURE.get(ct, 0)
+            t_ok = (float(r["temperature"]) >= min_t) if min_t and r["temperature"] else True
+            p_ok = (float(r["pressure"])    >= min_p) if min_p and r["pressure"]    else True
+            e_ok = (float(r["exposure_time"]) >= min_e) if min_e and r["exposure_time"] else True
+            return t_ok and p_ok and e_ok
+        n_prog_ok = int(est_eval.apply(_prog_ok, axis=1).sum())
+    else:
+        n_prog_ok = 0
+    ind_aami["Parámetros programados conformes"] = {
+        "pct": round(n_prog_ok / n_est * 100, 1) if n_est else 100.0,
+        "n_ok": n_prog_ok, "n_total": n_est,
+        "weight": _SC_WEIGHTS["AAMI ST79"]["Parámetros programados conformes"],
+        "tooltip": "% ciclos donde temperatura, presión y tiempo programados ≥ mínimos normativos.",
+    }
+
+    # 4. Doble verificación en liberación
+    lib = rec[rec["stage"] == "Validación / liberación de carga"] if not rec.empty else rec
+    n_lib = len(lib)
+    if n_lib:
+        n_lib_ok = int(lib["release_supervisor"].fillna("").apply(lambda x: str(x).strip() != "").sum())
+    else:
+        n_lib_ok = 0
+    ind_aami["Doble verificación en liberación"] = {
+        "pct": round(n_lib_ok / n_lib * 100, 1) if n_lib else 100.0,
+        "n_ok": n_lib_ok, "n_total": n_lib,
+        "weight": _SC_WEIGHTS["AAMI ST79"]["Doble verificación en liberación"],
+        "tooltip": "% de liberaciones de carga con supervisor / segundo verificador registrado.",
+    }
+
+    # 5. Cumplimiento de protocolo
+    if not rec.empty:
+        n_comp_t = len(rec)
+        n_comp_ok = int((rec["complies"] == "Sí").sum())
+    else:
+        n_comp_t = 0; n_comp_ok = 0
+    ind_aami["Cumplimiento de protocolo"] = {
+        "pct": round(n_comp_ok / n_comp_t * 100, 1) if n_comp_t else 100.0,
+        "n_ok": n_comp_ok, "n_total": n_comp_t,
+        "weight": _SC_WEIGHTS["AAMI ST79"]["Cumplimiento de protocolo"],
+        "tooltip": "% de registros marcados como 'Sí cumple protocolo'.",
+    }
+    result["AAMI ST79"] = _aggregate_norm(ind_aami, _SC_WEIGHTS["AAMI ST79"])
+
+    # ── ISO 17665-1 / EN 285 (parámetros reales de autoclave) ────────────────
+    ind_17665: dict = {}
+    est_real = est_eval.dropna(subset=["actual_temperature", "actual_pressure", "actual_exposure_time"]) if n_est else pd.DataFrame()
+    nr = len(est_real)
+
+    for col_r, col_min_fn, label, w_key in [
+        ("actual_temperature",   lambda ct: STERIL_MIN_TEMP.get(ct),
+         "Temperatura real conforme",  "Temperatura real conforme"),
+        ("actual_pressure",      lambda ct: STERIL_MIN_PRESSURE.get(ct),
+         "Presión real conforme",      "Presión real conforme"),
+        ("actual_exposure_time", lambda ct: STERIL_MIN_EXPOSURE.get(ct, 0),
+         "Exposición real conforme",   "Exposición real conforme"),
+    ]:
+        if nr:
+            ok_mask_r = est_real.apply(
+                lambda r, _c=col_r, _f=col_min_fn: (
+                    float(r[_c]) >= _f(r["cycle_type"])
+                    if _f(r["cycle_type"]) and r[_c] else True
+                ), axis=1)
+            n_r_ok = int(ok_mask_r.sum())
+        else:
+            n_r_ok = 0
+        tooltip_map = {
+            "Temperatura real conforme":  "% ciclos donde temperatura real ≥ mínimo EN 285 / ISO 17665.",
+            "Presión real conforme":      "% ciclos donde presión real ≥ mínimo EN 285:2015 §22.3.",
+            "Exposición real conforme":   "% ciclos donde tiempo real ≥ mínimo AAMI ST79 / EN 285.",
+        }
+        ind_17665[label] = {
+            "pct": round(n_r_ok / nr * 100, 1) if nr else 100.0,
+            "n_ok": n_r_ok, "n_total": nr,
+            "weight": _SC_WEIGHTS["ISO 17665 / EN 285"][w_key],
+            "tooltip": tooltip_map[label],
+        }
+    result["ISO 17665 / EN 285"] = _aggregate_norm(ind_17665, _SC_WEIGHTS["ISO 17665 / EN 285"])
+
+    # ── ISO 15883 (limpieza y descontaminación) ───────────────────────────────
+    lim = rec[rec["stage"] == "Limpieza y descontaminación"] if not rec.empty else rec
+    nl  = len(lim)
+    nl_ok = int((lim["cleaning_complies"] == "Conforme").sum()) if nl else 0
+    ind_15883 = {
+        "Limpieza conforme": {
+            "pct": round(nl_ok / nl * 100, 1) if nl else 100.0,
+            "n_ok": nl_ok, "n_total": nl,
+            "weight": 1.0,
+            "tooltip": "% de registros de Limpieza con resultado 'Conforme' (ISO 15883-1).",
+        }
+    }
+    result["ISO 15883"] = _aggregate_norm(ind_15883, _SC_WEIGHTS["ISO 15883"])
+
+    # ── ISO 13485:2016 §9 (gestión de calidad) ───────────────────────────────
+    ind_13485: dict = {}
+
+    # Alertas Alta cerradas
+    al_alta = alerts_df[alerts_df["severity"] == "Alta"] if not alerts_df.empty else alerts_df
+    na_t = len(al_alta)
+    na_ok = int((al_alta["status"] == "Cerrada").sum()) if na_t else 0
+    ind_13485["Alertas Alta cerradas"] = {
+        "pct": round(na_ok / na_t * 100, 1) if na_t else 100.0,
+        "n_ok": na_ok, "n_total": na_t,
+        "weight": _SC_WEIGHTS["ISO 13485 §9"]["Alertas Alta cerradas"],
+        "tooltip": "% de alertas de severidad Alta que fueron cerradas.",
+    }
+
+    # NC cerradas
+    nnc_t  = len(nc_df)
+    nnc_ok = int((nc_df["status"] == "Cerrada").sum()) if nnc_t else 0
+    ind_13485["NC cerradas"] = {
+        "pct": round(nnc_ok / nnc_t * 100, 1) if nnc_t else 100.0,
+        "n_ok": nnc_ok, "n_total": nnc_t,
+        "weight": _SC_WEIGHTS["ISO 13485 §9"]["NC cerradas"],
+        "tooltip": "% de no conformidades cerradas con evidencia.",
+    }
+
+    # Sin recalls activos
+    n_recall = len(recalls_df[recalls_df["status"] == "Activo"]) if not recalls_df.empty else 0
+    ind_13485["Sin recalls activos"] = {
+        "pct": 100.0 if n_recall == 0 else 0.0,
+        "n_ok": 1 if n_recall == 0 else 0, "n_total": 1,
+        "weight": _SC_WEIGHTS["ISO 13485 §9"]["Sin recalls activos"],
+        "tooltip": "100% si no hay eventos de retiro activos; 0% si hay alguno.",
+    }
+    result["ISO 13485 §9"] = _aggregate_norm(ind_13485, _SC_WEIGHTS["ISO 13485 §9"])
+
+    # ── Res. 4816/2008 MinSalud Colombia ─────────────────────────────────────
+    ind_res: dict = {}
+
+    # Tasa de rechazo ≤ 5 %
+    if not rec.empty:
+        est_rec = rec[rec["stage"].isin(["Esterilización", "Validación / liberación de carga"])]
+        lotes_r = est_rec.groupby(["instrument_code", "batch_code"])["result"].apply(
+            lambda x: "Rechazado" in x.values)
+        n_lotes_r   = len(lotes_r)
+        n_rechazados = int(lotes_r.sum())
+        tasa_rec = (n_rechazados / n_lotes_r * 100) if n_lotes_r else 0
+        pct_rec_ok = max(0.0, round(100 - tasa_rec * 20, 1))   # cada 1% sobre 5% resta 20 pts
+    else:
+        n_lotes_r = 0; n_rechazados = 0; tasa_rec = 0; pct_rec_ok = 100.0
+    ind_res["Tasa de rechazo ≤ 5 %"] = {
+        "pct": pct_rec_ok,
+        "n_ok": n_lotes_r - n_rechazados, "n_total": n_lotes_r,
+        "weight": _SC_WEIGHTS["Res. 4816/2008"]["Tasa de rechazo ≤ 5 %"],
+        "tooltip": f"Tasa actual: {tasa_rec:.1f}% de lotes rechazados. Meta ≤ 5 %.",
+    }
+
+    # Insumos vigentes
+    if not cons_df.empty:
+        cons_act = cons_df[cons_df["status"] == "Activo"]
+        nc_v = len(cons_act)
+        nc_ok_v = int(cons_act["expiration_date"].apply(
+            lambda d: date.fromisoformat(str(d)) > today if d else False).sum())
+    else:
+        nc_v = 0; nc_ok_v = 0
+    ind_res["Insumos vigentes"] = {
+        "pct": round(nc_ok_v / nc_v * 100, 1) if nc_v else 100.0,
+        "n_ok": nc_ok_v, "n_total": nc_v,
+        "weight": _SC_WEIGHTS["Res. 4816/2008"]["Insumos vigentes"],
+        "tooltip": "% de lotes de insumos activos con fecha de vencimiento vigente.",
+    }
+
+    # Equipos calibrados
+    if not cal_df.empty:
+        n_eq = len(cal_df)
+        n_eq_ok = int(cal_df["next_calibration_date"].apply(
+            lambda d: date.fromisoformat(str(d)) > today if d else False).sum())
+    else:
+        n_eq = 0; n_eq_ok = 0
+    ind_res["Equipos calibrados"] = {
+        "pct": round(n_eq_ok / n_eq * 100, 1) if n_eq else 100.0,
+        "n_ok": n_eq_ok, "n_total": n_eq,
+        "weight": _SC_WEIGHTS["Res. 4816/2008"]["Equipos calibrados"],
+        "tooltip": "% de equipos registrados con certificado de calibración vigente.",
+    }
+
+    # IB sin positivos
+    n_bi = len(bi_df)
+    n_bi_pos = int((bi_df["result"] == "Positivo").sum()) if n_bi else 0
+    ind_res["IB sin positivos"] = {
+        "pct": round((n_bi - n_bi_pos) / n_bi * 100, 1) if n_bi else 100.0,
+        "n_ok": n_bi - n_bi_pos, "n_total": n_bi,
+        "weight": _SC_WEIGHTS["Res. 4816/2008"]["IB sin positivos"],
+        "tooltip": "% de indicadores biológicos registrados con resultado no positivo.",
+    }
+    result["Res. 4816/2008"] = _aggregate_norm(ind_res, _SC_WEIGHTS["Res. 4816/2008"])
+
+    return result
+
+
+def _aggregate_norm(indicators: dict, weights: dict) -> dict:
+    """Calcula el puntaje ponderado de una norma a partir de sus indicadores."""
+    score = 0.0
+    w_sum = 0.0
+    for name, data in indicators.items():
+        w = data.get("weight", 0)
+        score += data["pct"] * w
+        w_sum += w
+    return {
+        "score":      round(score, 1),
+        "indicators": indicators,
+        "weight_sum": round(w_sum, 3),
+    }
+
+
+def _sc_color(pct: float, target: float) -> str:
+    if pct >= target:        return "#2ca02c"   # verde
+    elif pct >= target * 0.85: return "#ff7f0e"  # naranja
+    else:                    return "#d62728"   # rojo
+
+
+def _sc_semaforo(pct: float, target: float) -> str:
+    if pct >= target:            return "🟢"
+    elif pct >= target * 0.85:   return "🟡"
+    else:                        return "🔴"
+
+
+def scorecard_module():
+    """Panel de cumplimiento normativo calculado desde los registros reales.
+
+    Referencia: ISO 13485:2016 §9 — Evaluación del desempeño.
+    """
+    st.header("📋 Scorecard de cumplimiento normativo")
+    st.caption(
+        "Referencia: ISO 13485:2016 §9 — Seguimiento, medición, análisis y evaluación. "
+        "Los indicadores se calculan en tiempo real desde los registros del sistema."
+    )
+
+    # ── Meta configurable ─────────────────────────────────────────────────────
+    col_t1, col_t2 = st.columns([2, 1])
+    target = col_t1.slider(
+        "🎯 Meta de cumplimiento (%)",
+        min_value=50, max_value=100, value=90, step=5,
+        help="Ajuste la meta mínima aceptable de cumplimiento. "
+             "Referencia habitual: ≥ 90 % (ISO 13485:2016 / AAMI ST79).",
+    )
+    col_t2.markdown(" ")
+    col_t2.markdown(f"**Meta actual:** `{target}%`")
+
+    # ── Computar scorecard ────────────────────────────────────────────────────
+    with st.spinner("Calculando indicadores …"):
+        sc = _compute_scorecard()
+
+    # ── Semáforo global ───────────────────────────────────────────────────────
+    global_score = round(sum(v["score"] for v in sc.values()) / len(sc), 1)
+    global_icon  = _sc_semaforo(global_score, target)
+    global_color = _sc_color(global_score, target)
+
+    st.markdown("---")
+    g1, g2, g3 = st.columns([1, 2, 1])
+    with g2:
+        st.markdown(
+            f"""
+            <div style="text-align:center;padding:1.2rem 1.5rem;
+                        background:rgba(0,0,0,0.15);border-radius:16px;
+                        border:2px solid {global_color};">
+                <div style="font-size:3rem;line-height:1">{global_icon}</div>
+                <div style="font-size:2.8rem;font-weight:900;color:{global_color};margin:0.3rem 0">
+                    {global_score}%
+                </div>
+                <div style="font-size:0.95rem;color:#aaa;font-weight:600;letter-spacing:1px">
+                    CUMPLIMIENTO GLOBAL · META {target}%
+                </div>
+                <div style="font-size:0.78rem;color:#777;margin-top:0.4rem">
+                    ISO 13485:2016 §9 — {date.today().strftime('%d/%m/%Y')}
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    st.markdown("---")
+
+    # ── Tarjetas por norma ────────────────────────────────────────────────────
+    st.subheader("Resumen por norma")
+    norm_names = list(sc.keys())
+    cols_n = st.columns(len(norm_names))
+    for i, norm in enumerate(norm_names):
+        data_n = sc[norm]
+        s = data_n["score"]
+        ico = _sc_semaforo(s, target)
+        clr = _sc_color(s, target)
+        with cols_n[i]:
+            st.markdown(
+                f"""<div style="text-align:center;padding:0.9rem 0.6rem;
+                              background:rgba(0,0,0,0.12);border-radius:12px;
+                              border:1px solid {clr};margin-bottom:0.5rem;">
+                    <div style="font-size:1.6rem">{ico}</div>
+                    <div style="font-size:1.8rem;font-weight:800;color:{clr}">{s}%</div>
+                    <div style="font-size:0.72rem;font-weight:700;color:#ccc;
+                                letter-spacing:0.5px;text-transform:uppercase">{norm}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+    # ── Gráfica de radar / barras ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Visualización comparativa por norma")
+    plt = _get_plt()
+    fig, (ax_bar, ax_pie) = plt.subplots(1, 2, figsize=(12, 4))
+
+    norms  = list(sc.keys())
+    scores = [sc[n]["score"] for n in norms]
+    colors_bar = [_sc_color(s, target) for s in scores]
+
+    ax_bar.barh(norms, scores, color=colors_bar, height=0.55)
+    ax_bar.axvline(target, color="#555", linestyle="--", linewidth=1.2, label=f"Meta {target}%")
+    ax_bar.set_xlim(0, 105)
+    ax_bar.set_xlabel("Cumplimiento (%)")
+    ax_bar.set_title("Cumplimiento por norma", fontsize=10)
+    for i, (s, n) in enumerate(zip(scores, norms)):
+        ax_bar.text(s + 0.5, i, f"{s}%", va="center", fontsize=9, fontweight="bold")
+    ax_bar.legend(fontsize=8)
+
+    ax_pie.pie(
+        scores,
+        labels=[n.replace(" §9", "").replace(" / EN 285", "\n/ EN 285") for n in norms],
+        colors=colors_bar,
+        autopct="%1.0f%%",
+        startangle=90,
+        pctdistance=0.78,
+        textprops={"fontsize": 8},
+    )
+    ax_pie.set_title("Distribución de cumplimiento", fontsize=10)
+
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # ── Detalle por norma ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Detalle de indicadores por norma")
+
+    norm_ref = {
+        "AAMI ST79":         "AAMI ST79:2017 — Guía integral de esterilización por vapor.",
+        "ISO 17665 / EN 285":"ISO 17665-1:2006 / EN 285:2015 — Esterilización con vapor a presión.",
+        "ISO 15883":         "ISO 15883-1:2006 — Lavadoras-desinfectadoras / limpieza y descontaminación.",
+        "ISO 13485 §9":      "ISO 13485:2016 §9 — Seguimiento, medición y evaluación del SGC.",
+        "Res. 4816/2008":    "Resolución 4816/2008 MinSalud Colombia — Tecnovigilancia / red nacional.",
+    }
+
+    for norm, data_n in sc.items():
+        score_n = data_n["score"]
+        ico_n   = _sc_semaforo(score_n, target)
+        clr_n   = _sc_color(score_n, target)
+        with st.expander(f"{ico_n} {norm} — {score_n}% (meta: {target}%)", expanded=score_n < target):
+            st.caption(norm_ref.get(norm, ""))
+            inds = data_n["indicators"]
+
+            # Tabla resumen
+            rows_tab = []
+            for ind_name, ind_data in inds.items():
+                rows_tab.append({
+                    "": _sc_semaforo(ind_data["pct"], target),
+                    "Indicador":     ind_name,
+                    "Resultado (%)": ind_data["pct"],
+                    "Aprobados":     ind_data["n_ok"],
+                    "Evaluados":     ind_data["n_total"],
+                    "Peso":          f"{int(ind_data['weight'] * 100)}%",
+                    "Descripción":   ind_data.get("tooltip", ""),
+                })
+            df_tab = pd.DataFrame(rows_tab)
+            st.dataframe(
+                df_tab,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Resultado (%)": st.column_config.ProgressColumn(
+                        "Resultado (%)",
+                        min_value=0, max_value=100,
+                        format="%.1f%%",
+                    )
+                },
+            )
+
+            # Mini-barra por indicador
+            fig2, ax2 = plt.subplots(figsize=(7, max(1.2, len(inds) * 0.55)))
+            names_i   = [d["Indicador"] for d in rows_tab]
+            pcts_i    = [d["Resultado (%)"] for d in rows_tab]
+            clrs_i    = [_sc_color(p, target) for p in pcts_i]
+            ax2.barh(names_i, pcts_i, color=clrs_i, height=0.55)
+            ax2.axvline(target, color="#555", linestyle="--", linewidth=1.1, label=f"Meta {target}%")
+            ax2.set_xlim(0, 108)
+            for j, pv in enumerate(pcts_i):
+                ax2.text(pv + 0.5, j, f"{pv}%", va="center", fontsize=8)
+            ax2.set_title(norm, fontsize=9)
+            ax2.legend(fontsize=7)
+            fig2.tight_layout()
+            st.pyplot(fig2)
+            plt.close(fig2)
+
+            # Acciones recomendadas para indicadores en rojo
+            poorly = [r for r in rows_tab if r["Resultado (%)"] < target * 0.85]
+            if poorly:
+                st.warning(
+                    "**Acciones recomendadas** (indicadores críticos — < 85% de la meta):\n"
+                    + "\n".join(f"- **{r['Indicador']}** ({r['Resultado (%)']:.1f}%): {r['Descripción']}"
+                                for r in poorly)
+                )
+
+    # ── Exportar scorecard ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Exportar")
+    export_rows = []
+    for norm, data_n in sc.items():
+        for ind_name, ind_data in data_n["indicators"].items():
+            export_rows.append({
+                "Norma": norm, "Indicador": ind_name,
+                "Cumplimiento (%)": ind_data["pct"],
+                "Aprobados": ind_data["n_ok"],
+                "Evaluados": ind_data["n_total"],
+                "Peso en norma (%)": int(ind_data["weight"] * 100),
+                "Meta (%)": target,
+                "Estado": "✅ OK" if ind_data["pct"] >= target else (
+                    "⚠️ Alerta" if ind_data["pct"] >= target * 0.85 else "❌ Crítico"),
+                "Fecha cálculo": date.today().isoformat(),
+            })
+    df_export = pd.DataFrame(export_rows)
+    buf_sc = io.BytesIO()
+    with pd.ExcelWriter(buf_sc, engine="openpyxl") as _wr:
+        df_export.to_excel(_wr, index=False, sheet_name="Scorecard normativo")
+    st.download_button(
+        "📥 Descargar scorecard (Excel)",
+        data=buf_sc.getvalue(),
+        file_name=f"scorecard_normativo_{date.today()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    audit(st.session_state["user"], "Scorecard consultado", "Scorecard",
+          f"Score global: {global_score}% · Meta: {target}%")
+
+
 # ─── Limitaciones ─────────────────────────────────────────────────────────────
 def limitations_module():
     st.header("11. Limitaciones del prototipo")
@@ -4875,7 +6705,8 @@ def main():
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
         "🔍 Consulta de trazabilidad","🚨 Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
-        "📊 Reportes e indicadores","📊 Indicadores (F / Q / B)","🔩 Calibración de equipos","📋 No conformidades","📝 Encuesta de percepción",
+        "📊 Reportes e indicadores","📊 Indicadores (F / Q / B)","🔩 Calibración de equipos","🛠️ Mantenimiento de equipos","📋 No conformidades",
+        "📋 Scorecard normativo","📦 Insumos y consumibles","🗂️ Sets quirúrgicos","📝 Encuesta de percepción",
         "🔒 Auditoría de cambios","⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
     ]
     menu=st.sidebar.radio("Menú",MENU)
@@ -4890,7 +6721,11 @@ def main():
         "📊 Reportes e indicadores":reports_module,
         "📊 Indicadores (F / Q / B)":biological_indicators_module,
         "🔩 Calibración de equipos":calibration_module,
+        "🛠️ Mantenimiento de equipos":maintenance_module,
         "📋 No conformidades":nonconformities_module,
+        "📋 Scorecard normativo":scorecard_module,
+        "📦 Insumos y consumibles":consumables_module,
+        "🗂️ Sets quirúrgicos":surgical_sets_module,
         "📝 Encuesta de percepción":survey_module,
         "🔒 Auditoría de cambios":audit_module,
         "⚙️ Configuración y respaldo":config_module,
