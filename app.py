@@ -909,11 +909,29 @@ def init_db():
         role TEXT NOT NULL DEFAULT 'Personal de central',
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT)""")
+    # ─ Índices de rendimiento ──────────────────────────────────────────────
+    # process_records: consultas más frecuentes por lote/instrumento y etapa
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_code_batch  ON process_records(instrument_code, batch_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_stage       ON process_records(stage)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_created_at  ON process_records(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_result      ON process_records(result)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_exp_date    ON process_records(expiration_date)")
+    # alerts: filtros por estado, severidad y lote
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_al_code_batch  ON alerts(instrument_code, batch_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_al_status_sev  ON alerts(status, severity)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_al_created_at  ON alerts(created_at)")
+    # audit_log: filtros por usuario y módulo
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aud_username   ON audit_log(username)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aud_module     ON audit_log(module)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aud_created_at ON audit_log(created_at)")
+    # improvement_plans: filtro por estado pendiente
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_imp_state      ON improvement_plans(state)")
     c.commit(); c.close()
 
 def _migrate_db():
-    """Agrega columnas nuevas sin romper BD existente (migración segura)."""
+    """Agrega columnas e índices nuevos sin romper BD existente (migración segura)."""
     c = connect()
+    # ─ Nuevas columnas ──────────────────────────────────────────────────
     for stmt in [
         "ALTER TABLE alerts ADD COLUMN closing_reason TEXT",
     ]:
@@ -921,6 +939,26 @@ def _migrate_db():
             c.execute(stmt); c.commit()
         except sqlite3.OperationalError:
             pass  # columna ya existe
+    # ─ Índices (idempotentes: IF NOT EXISTS) ────────────────────────────
+    idx_stmts = [
+        "CREATE INDEX IF NOT EXISTS idx_pr_code_batch  ON process_records(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_stage       ON process_records(stage)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_created_at  ON process_records(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_result      ON process_records(result)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_exp_date    ON process_records(expiration_date)",
+        "CREATE INDEX IF NOT EXISTS idx_al_code_batch  ON alerts(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_al_status_sev  ON alerts(status, severity)",
+        "CREATE INDEX IF NOT EXISTS idx_al_created_at  ON alerts(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_aud_username   ON audit_log(username)",
+        "CREATE INDEX IF NOT EXISTS idx_aud_module     ON audit_log(module)",
+        "CREATE INDEX IF NOT EXISTS idx_aud_created_at ON audit_log(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_imp_state      ON improvement_plans(state)",
+    ]
+    for stmt in idx_stmts:
+        try:
+            c.execute(stmt); c.commit()
+        except sqlite3.OperationalError:
+            pass
     c.close()
 
 def seed_demo_data():
