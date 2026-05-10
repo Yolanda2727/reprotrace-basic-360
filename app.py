@@ -942,6 +942,23 @@ def init_db():
     # patient_deliveries: trazabilidad paciente y búsqueda recall
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pd_code_batch  ON patient_deliveries(instrument_code, batch_code)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pd_patient_id  ON patient_deliveries(patient_id)")
+    # recall_events: eventos formales de retiro de lote
+    cur.execute("""CREATE TABLE IF NOT EXISTS recall_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_code TEXT NOT NULL,
+        batch_code TEXT NOT NULL,
+        trigger_type TEXT NOT NULL,
+        trigger_description TEXT,
+        patients_affected INTEGER DEFAULT 0,
+        corrective_action TEXT,
+        status TEXT NOT NULL DEFAULT 'Activo',
+        closed_by TEXT,
+        closed_at TEXT,
+        closure_notes TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_re_code_batch ON recall_events(instrument_code, batch_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_re_status     ON recall_events(status)")
     c.commit(); c.close()
 
 def _migrate_db():
@@ -957,6 +974,20 @@ def _migrate_db():
         procedure_type TEXT,
         operating_room TEXT,
         delivery_date TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS recall_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_code TEXT NOT NULL,
+        batch_code TEXT NOT NULL,
+        trigger_type TEXT NOT NULL,
+        trigger_description TEXT,
+        patients_affected INTEGER DEFAULT 0,
+        corrective_action TEXT,
+        status TEXT NOT NULL DEFAULT 'Activo',
+        closed_by TEXT,
+        closed_at TEXT,
+        closure_notes TEXT,
         registered_by TEXT,
         created_at TEXT)""")
     c.commit()
@@ -985,6 +1016,8 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_imp_state      ON improvement_plans(state)",
         "CREATE INDEX IF NOT EXISTS idx_pd_code_batch  ON patient_deliveries(instrument_code, batch_code)",
         "CREATE INDEX IF NOT EXISTS idx_pd_patient_id  ON patient_deliveries(patient_id)",
+        "CREATE INDEX IF NOT EXISTS idx_re_code_batch ON recall_events(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_re_status     ON recall_events(status)",
     ]
     for stmt in idx_stmts:
         try:
@@ -1122,7 +1155,44 @@ def _check_expiring_packages():
         elif 0<=days<=7 and not _has("Vencimiento próximo"):
             add_alert(code,batch,"Vencimiento próximo","Media",f"Paquete vence en {days} día(s) ({exp.isoformat()}). Planificar uso o reprocesamiento.")
 
-# ─── Gráficas ─────────────────────────────────────────────────────────────────
+def _trigger_recall(code: str, batch: str, trigger_type: str, description: str, user: str) -> bool:
+    """Crea un evento formal de retiro de lote si el lote fue distribuido a pacientes.
+
+    Retorna True si el recall fue activado. Res. 4816/2008 MinSalud / ISO 13485:2016 §8.3.
+    Solo crea el evento si no existe ya uno activo con el mismo trigger para el mismo lote.
+    """
+    # Verificar si el lote fue distribuido (patient_deliveries o stage Distribución)
+    pd_cnt = query_df(
+        "SELECT COUNT(*) as n FROM patient_deliveries WHERE instrument_code=? AND batch_code=?",
+        (code, batch)).iloc[0]["n"]
+    dist_cnt = query_df(
+        "SELECT COUNT(*) as n FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Distribución'",
+        (code, batch)).iloc[0]["n"]
+    if pd_cnt == 0 and dist_cnt == 0:
+        return False   # lote no distribuido — no requiere recall
+    # Evitar duplicados: si ya existe un recall Activo por el mismo trigger en este lote, salir
+    existing = query_df(
+        "SELECT id FROM recall_events WHERE instrument_code=? AND batch_code=? "
+        "AND trigger_type=? AND status='Activo'",
+        (code, batch, trigger_type))
+    if not existing.empty:
+        return False
+    # Acción correctiva recomendada
+    corr = AUTO_REC.get(trigger_type,
+           "Aislar el lote, notificar al jefe de central y al equipo clínico. "
+           "Documentar y abrir plan de mejora. Res. 4816/2008 MinSalud Colombia.")
+    execute("""
+        INSERT INTO recall_events
+            (instrument_code,batch_code,trigger_type,trigger_description,
+             patients_affected,corrective_action,status,registered_by,created_at)
+        VALUES(?,?,?,?,?,?,'Activo',?,?)""",
+        (code, batch, trigger_type, description,
+         int(pd_cnt), corr, user, datetime.now().isoformat()))
+    audit(user, "Recall activado automaticamente", "Recall",
+          f"{code}/{batch} | Causa: {trigger_type} | Pacientes expuestos: {int(pd_cnt)}")
+    return True
+
+# ─── Gráficas ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def fig_bytes(fig):
     buf=io.BytesIO(); fig.savefig(buf,format="png",bbox_inches="tight",dpi=150); buf.seek(0); return buf.read()
 
@@ -1619,6 +1689,16 @@ def dashboard():
             st.caption(f"🔴 {len(_criticos)} lote(s) requieren atención. Navegue a Alertas o Trazabilidad para gestionar cada caso.")
     else:
         st.info("Sin registros de proceso aún.")
+    # ── Panel de recalls activos ─────────────────────────────────────────────
+    _recalls=query_df("SELECT instrument_code,batch_code,trigger_type,patients_affected,created_at FROM recall_events WHERE status='Activo' ORDER BY created_at DESC")
+    if not _recalls.empty:
+        st.markdown("---")
+        st.subheader("🚨 Retiros de lote activos")
+        st.error(f"⚠️ **{len(_recalls)} evento(s) de retiro ACTIVO(S).** Acceda al módulo '🚨 Retiro de lote (Recall)' para gestionarlos.")
+        st.dataframe(_recalls.rename(columns={
+            "instrument_code":"Código","batch_code":"Lote","trigger_type":"Causa",
+            "patients_affected":"Pacientes expuestos","created_at":"Activado en"}),
+            use_container_width=True)
 
 # ─── Registro de instrumental ─────────────────────────────────────────────────
 def instruments_module():
@@ -1868,6 +1948,21 @@ def process_module():
         if bi_i=="No conforme": add_alert(code,batch.strip(),"Indicador biológico no conforme","Alta","Indicador biológico no conforme. Rechazar carga.")
         if ch_i=="No conforme": add_alert(code,batch.strip(),"Indicador no conforme","Alta","Indicador químico no conforme en validación.")
         if cl_c=="No conforme": add_alert(code,batch.strip(),"Limpieza no conforme","Alta",f"Limpieza no conforme. {cl_n}")
+        # ─ Detección automática de recall post-distribución (Res. 4816/2008 / ISO 13485 §8.3) ──
+        _usr=st.session_state["user"]
+        if bi_i=="No conforme":
+            _rc=_trigger_recall(code,batch.strip(),"Indicador biológico no conforme",
+                                f"Indicador biológico no conforme en {stage}. Lote potencialmente contaminado.",_usr)
+            if _rc:
+                st.error("🚨 RECALL ACTIVADO AUTOMÁTICAMENTE: el indicador biológico no conforme y este lote "
+                         "ya fue distribuido. Se creó un Evento de Retiro en el módulo '🚨 Retiro de lote (Recall)'. "
+                         "Notifique al personal clínico inmediatamente (Res. 4816/2008 MinSalud).")
+        if result=="Rechazado" and stage in ["Esterilización","Validación / liberación de carga"]:
+            _rc2=_trigger_recall(code,batch.strip(),"Ciclo rechazado",
+                                 f"Ciclo rechazado en {stage}. Lote no apto para uso clínico.",_usr)
+            if _rc2:
+                st.error("🚨 RECALL ACTIVADO AUTOMÁTICAMENTE: ciclo rechazado y lote ya distribuido. "
+                         "Verifique el módulo '🚨 Retiro de lote (Recall)' y active el protocolo institucional.")
         # ─ Validación de tiempos mínimos por etapa (AAMI ST79 / ISO 15883 / EN 285)
         _min_dur=STAGE_MIN_DURATION.get(stage,0)
         if dur<_min_dur:
@@ -1972,7 +2067,138 @@ def recall_module():
         "afectar la seguridad del paciente. Permite identificar todos los pacientes expuestos "
         "a un lote específico y activar el protocolo de notificación. "
         "**Referencia normativa:** ISO 13485:2016 §8.3 — Resolución 4816/2008 MinSalud Colombia.")
-    tab1, tab2 = st.tabs(["🔍 Búsqueda por lote", "👤 Búsqueda por paciente"])
+    tab1, tab2, tab3 = st.tabs(["🔍 Búsqueda por lote", "👤 Búsqueda por paciente",
+                                 "📋 Eventos de retiro activos"])
+    with tab1:
+        st.subheader("Pacientes expuestos a un lote específico")
+        rc1,rc2=st.columns(2)
+        r_code=rc1.text_input("Código del instrumental",key="rc_code",placeholder="IQ-001")
+        r_batch=rc2.text_input("Número de lote",key="rc_batch",placeholder="LOTE-2026-001")
+        if st.button("🔍 Buscar pacientes expuestos",key="rc_search"):
+            if not r_code.strip() or not r_batch.strip():
+                st.error("Ingrese código de instrumental y número de lote."); return
+            pd_df=query_df(
+                "SELECT patient_id,patient_initials,procedure_type,operating_room,"
+                "delivery_date,registered_by,created_at "
+                "FROM patient_deliveries WHERE instrument_code=? AND batch_code=? ORDER BY created_at",
+                (r_code.strip(),r_batch.strip()))
+            al_df=query_df(
+                "SELECT alert_type,severity,description,status,created_at FROM alerts "
+                "WHERE instrument_code=? AND batch_code=? ORDER BY severity,created_at",
+                (r_code.strip(),r_batch.strip()))
+            st.markdown("---")
+            if not al_df.empty:
+                alta_cnt=len(al_df[al_df["severity"]=="Alta"])
+                if alta_cnt>0:
+                    st.error(f"🔴 **Lote con {alta_cnt} alerta(s) de riesgo ALTO**")
+                st.dataframe(al_df.rename(columns={
+                    "alert_type":"Tipo de alerta","severity":"Severidad",
+                    "description":"Descripción","status":"Estado","created_at":"Fecha"}),
+                    use_container_width=True)
+            else:
+                st.success("✅ No se encontraron alertas para este lote.")
+            if pd_df.empty:
+                st.info("No hay pacientes vinculados a este lote.")
+            else:
+                n=len(pd_df)
+                st.error(f"🚨 **{n} paciente(s) expuesto(s)** a este lote. "
+                         "Activar protocolo institucional de notificación.")
+                st.dataframe(pd_df.rename(columns={
+                    "patient_id":"ID Paciente","patient_initials":"Iniciales",
+                    "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+                    "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+                    "created_at":"Creado en"}), use_container_width=True)
+                # Descarga Excel del recall
+                out=io.BytesIO()
+                with pd.ExcelWriter(out,engine="xlsxwriter") as w:
+                    pd_df.to_excel(w,sheet_name="Pacientes_expuestos",index=False)
+                    if not al_df.empty:
+                        al_df.to_excel(w,sheet_name="Alertas_lote",index=False)
+                out.seek(0)
+                st.download_button(
+                    "📥 Descargar listado de recall (Excel)",
+                    data=out.read(),
+                    file_name=f"recall_{r_code.strip()}_{r_batch.strip()}_{date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                audit(st.session_state["user"],"Consulta recall","Recall",
+                      f"{r_code.strip()}/{r_batch.strip()} — {n} paciente(s) expuesto(s)")
+    with tab2:
+        st.subheader("Historial de lotes recibidos por un paciente")
+        p_id=st.text_input("ID del paciente / Historia clínica",key="rc_pid",placeholder="HC-2026-00123")
+        if st.button("🔍 Buscar historial del paciente",key="rc_pid_search"):
+            if not p_id.strip():
+                st.error("Ingrese el ID del paciente."); return
+            pr_df=query_df(
+                "SELECT instrument_code,batch_code,procedure_type,operating_room,"
+                "delivery_date,registered_by,created_at "
+                "FROM patient_deliveries WHERE patient_id=? ORDER BY created_at",
+                (p_id.strip(),))
+            st.markdown("---")
+            if pr_df.empty:
+                st.info("No se encontraron registros de entrega para este paciente.")
+            else:
+                st.warning(f"El paciente **{p_id.strip()}** tiene {len(pr_df)} registro(s) de entrega de instrumental.")
+                st.dataframe(pr_df.rename(columns={
+                    "instrument_code":"Código","batch_code":"Lote",
+                    "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+                    "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+                    "created_at":"Creado en"}), use_container_width=True)
+                audit(st.session_state["user"],"Consulta paciente","Recall",
+                      f"Paciente: {p_id.strip()} — {len(pr_df)} lote(s)")
+    with tab3:
+        st.subheader("📋 Eventos de retiro activos / histórico")
+        st.caption("Generados automáticamente cuando se detecta un fallo crítico en un lote ya distribuido. "
+                   "Res. 4816/2008 MinSalud — ISO 13485:2016 §8.3.")
+        re_df=query_df("SELECT * FROM recall_events ORDER BY created_at DESC")
+        if re_df.empty:
+            st.success("✅ Sin eventos de retiro registrados.")
+        else:
+            activos=re_df[re_df["status"]=="Activo"]
+            cerrados=re_df[re_df["status"]!="Activo"]
+            if not activos.empty:
+                st.error(f"🚨 **{len(activos)} evento(s) de retiro ACTIVO(S)** — requieren acción inmediata.")
+                st.dataframe(activos[["id","instrument_code","batch_code","trigger_type",
+                                      "trigger_description","patients_affected",
+                                      "corrective_action","registered_by","created_at"]].rename(columns={
+                    "id":"ID","instrument_code":"Código","batch_code":"Lote",
+                    "trigger_type":"Causa","trigger_description":"Descripción",
+                    "patients_affected":"Pacientes expuestos","corrective_action":"Acción correctiva",
+                    "registered_by":"Registrado por","created_at":"Fecha activación"}),
+                    use_container_width=True)
+                # Cierre de evento de retiro
+                st.markdown("---")
+                st.subheader("Cerrar evento de retiro")
+                st.caption("Complete el cierre sólo cuando todas las acciones correctivas hayan sido implementadas "
+                           "y se haya notificado a los servicios clínicos afectados.")
+                re_opts=[f"ID {r['id']} — {r['instrument_code']}/{r['batch_code']} — {r['trigger_type']}"
+                         for _,r in activos.iterrows()]
+                sel_re=st.selectbox("Evento a cerrar",re_opts,key="re_close_sel")
+                re_id=int(sel_re.split("ID ")[1].split(" ")[0])
+                closure_notes=st.text_area("Acciones realizadas y justificación de cierre *",
+                                           key="re_close_notes",
+                                           placeholder="Describa las acciones correctivas implementadas, "
+                                           "notificaciones al personal clínico y resultado del seguimiento.")
+                if st.button("✅ Cerrar evento de retiro",key="re_close_btn"):
+                    if not closure_notes.strip():
+                        st.error("Las notas de cierre son obligatorias."); return
+                    _now=datetime.now().isoformat()
+                    _usr=st.session_state["user"]
+                    execute("UPDATE recall_events SET status='Cerrado',closed_by=?,closed_at=?,closure_notes=? WHERE id=?",
+                            (_usr,_now,closure_notes.strip(),re_id))
+                    audit(_usr,"Recall cerrado","Recall",
+                          f"Evento {re_id} cerrado. Notas: {closure_notes.strip()[:80]}")
+                    st.success(f"✅ Evento de retiro ID {re_id} cerrado. Acciones registradas en auditoría.")
+                    st.rerun()
+            else:
+                st.success("✅ Sin eventos de retiro activos.")
+            if not cerrados.empty:
+                with st.expander(f"Historial de retiros cerrados ({len(cerrados)})"):
+                    st.dataframe(cerrados[["id","instrument_code","batch_code","trigger_type",
+                                           "patients_affected","closed_by","closed_at","closure_notes"]].rename(columns={
+                        "id":"ID","instrument_code":"Código","batch_code":"Lote",
+                        "trigger_type":"Causa","patients_affected":"Pacientes",
+                        "closed_by":"Cerrado por","closed_at":"Fecha cierre",
+                        "closure_notes":"Notas de cierre"}), use_container_width=True)
     with tab1:
         st.subheader("Pacientes expuestos a un lote específico")
         rc1,rc2=st.columns(2)
