@@ -1499,6 +1499,14 @@ def process_module():
         if not ok: st.warning(f"⚠️ {msg} Se guarda como desviación académica.")
         s_dt=datetime.combine(sd,st_); e_dt=datetime.combine(ed,et)
         if e_dt<s_dt: st.error("Hora final no puede ser anterior a la inicial."); return
+        if stage=="Esterilización":
+            _emq=query_df(
+                "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta' AND alert_type LIKE '%conforme%'",
+                (code,batch.strip()))
+            if not _emq.empty:
+                st.error(f"🔴 BLOQUEO DE SEGURIDAD: El lote tiene {len(_emq)} alerta(s) de indicador no conforme abiertas. Resuelva las alertas de Empaque antes de esterilizar.")
+                for _,_a in _emq.iterrows(): st.caption(f"• {_a['alert_type']}")
+                return
         if stage=="Distribución":
             _open=query_df(
                 "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta'",
