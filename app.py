@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as st_components
 import pandas as pd
 import sqlite3
-import io, zipfile, os, base64, smtplib, ssl
+import io, zipfile, os, base64, smtplib, ssl, hmac
 from datetime import datetime, date, timedelta
 from textwrap import wrap
 
@@ -489,7 +489,7 @@ def render_login_card():
                         (u, role, "Inicio de sesión", datetime.now().isoformat()))
                 audit(u, "Inicio de sesión", "Login")
                 st.rerun()
-            elif u in USERS and USERS[u]["password"] == p:
+            elif u in USERS and hmac.compare_digest(USERS[u]["password"], p):
                 role = USERS[u]["role"]
                 st.session_state.update({"login": True, "user": u, "role": role})
                 execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
@@ -1134,17 +1134,18 @@ def _migrate_db():
     c.close()
 
 def seed_demo_data():
+    # Tuplas: (code, name, category, spaulding, service_origin, quantity, status, max_cycles)
     demo = [
-        ("IQ-001","Pinza Kelly",       "Prensión",  "Crítico","Cirugía general",4,"Activo"),
-        ("IQ-002","Tijera Mayo",        "Corte",     "Crítico","Ginecología",    2,"Activo"),
-        ("IQ-003","Porta agujas",       "Sutura",    "Crítico","Ortopedia",      3,"Activo"),
-        ("IQ-004","Separador Farabeuf","Separación", "Crítico","Urgencias",      2,"Activo"),
+        ("IQ-001","Pinza Kelly",        "Prensión",   "Crítico","Cirugía general",4,"Activo",500),
+        ("IQ-002","Tijera Mayo",         "Corte",      "Crítico","Ginecología",    2,"Activo",300),
+        ("IQ-003","Porta agujas",        "Sutura",     "Crítico","Ortopedia",      3,"Activo",400),
+        ("IQ-004","Separador Farabeuf", "Separación",  "Crítico","Urgencias",      2,"Activo",200),
     ]
     for r in demo:
         try:
             execute("""INSERT INTO instruments
-                (code,name,category,spaulding,service_origin,quantity,status,registered_by,created_at)
-                VALUES(?,?,?,?,?,?,?,'sistema',?)""", (*r, datetime.now().isoformat()))
+                (code,name,category,spaulding,service_origin,quantity,status,max_cycles,registered_by,created_at)
+                VALUES(?,?,?,?,?,?,?,?,'sistema',?)""", (*r, datetime.now().isoformat()))
         except sqlite3.IntegrityError:
             pass
 
@@ -1154,14 +1155,17 @@ def audit(user, action, module, desc=""):
             (user, action, module, desc, datetime.now().isoformat()))
 
 def _check_password(plain, stored):
-    """Compara contraseña plana con hash bcrypt o texto plano (usuarios hardcoded)."""
+    """Compara contraseña con hash bcrypt o texto plano usando comparación segura.
+    Se usa hmac.compare_digest para prevenir ataques de temporización (OWASP A07).
+    """
     try:
         import bcrypt
         if stored.startswith("$2b$") or stored.startswith("$2a$"):
             return bcrypt.checkpw(plain.encode(), stored.encode())
     except ImportError:
         pass
-    return plain == stored
+    # Fallback para usuarios hardcoded: comparación segura contra timing attacks
+    return hmac.compare_digest(plain, stored)
 
 def _hash_password(plain):
     """Genera hash bcrypt si disponible, sino devuelve texto plano."""
@@ -1282,7 +1286,6 @@ def _generate_qr_bytes(data: str, size: int = 10, border: int = 2) -> bytes:
     """
     try:
         import qrcode as _qr
-        from PIL import Image as _Img
         qr = _qr.QRCode(
             version=None,
             error_correction=_qr.constants.ERROR_CORRECT_M,
@@ -1909,10 +1912,12 @@ def login_screen():
 
 def _live_avatar_floating():
     """Inyecta el widget LiveAvatar como iframe flotante fijo en la esquina inferior derecha."""
+    from urllib.parse import quote as _url_quote
     _la_key = st.secrets.get("liveavatar", {}).get("api_key", "")
     _la_params = "?orientation=horizontal"
     if _la_key and _la_key not in ("PEGA_AQUI_TU_CLAVE_API", "tu_clave_aqui", ""):
-        _la_params += f"&api_key={_la_key}"
+        # URL-encode para prevenir XSS si la clave contiene caracteres especiales (OWASP A03)
+        _la_params += f"&api_key={_url_quote(_la_key, safe='')}"
     avatar_url = f"https://embed.liveavatar.com/v1/c46cf5ac-deb0-4078-8d23-a0438f4d3482{_la_params}"
     # JS que escapa el sandbox de components.html e inyecta el iframe en el DOM raíz
     st_components.html(f"""
@@ -4123,8 +4128,10 @@ def config_module():
         confirm=st.text_input("Escriba CONFIRMAR para limpiar datos de prueba")
         if confirm=="CONFIRMAR":
             if st.button("🗑️ Limpiar datos de prueba"):
-                for t in ["process_records","alerts","improvement_plans","audit_log"]:
-                    execute(f"DELETE FROM {t}")
+                execute("DELETE FROM process_records")
+                execute("DELETE FROM alerts")
+                execute("DELETE FROM improvement_plans")
+                execute("DELETE FROM audit_log")
                 # Las encuestas de percepción NO se eliminan con el reset de demo;
                 # solo el administrador puede borrarlas desde la sección 7.
                 execute("DELETE FROM instruments WHERE registered_by='sistema'")
