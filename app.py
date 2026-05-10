@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as st_components
 import pandas as pd
 import sqlite3
-import io, zipfile, os, base64
+import io, zipfile, os, base64, smtplib, ssl
 from datetime import datetime, date, timedelta
 from textwrap import wrap
 
@@ -1196,10 +1196,100 @@ def register_user(username, password, full_name, role):
             (username.strip().lower(), hashed, full_name.strip(), role, datetime.now().isoformat()))
     return True, ""
 
+def _get_email_cfg() -> dict:
+    """Lee la configuración SMTP desde st.secrets de forma segura.
+
+    Claves esperadas en secrets.toml / Streamlit Cloud → Settings → Secrets:
+      SMTP_HOST     — servidor SMTP (p.ej. smtp.gmail.com)
+      SMTP_PORT     — puerto (587 = STARTTLS, 465 = SSL)
+      SMTP_USER     — usuario / dirección del remitente
+      SMTP_PASSWORD — contraseña de aplicación (nunca credencial principal)
+      SMTP_FROM     — dirección visible en 'De:' (puede coincidir con SMTP_USER)
+      NOTIFY_EMAILS — destinatarios separados por coma
+    Devuelve {} si alguna clave obligatoria falta (modo sin notificaciones).
+    """
+    try:
+        s = st.secrets
+        required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "NOTIFY_EMAILS"]
+        if not all(k in s for k in required):
+            return {}
+        return {
+            "host":       str(s["SMTP_HOST"]).strip(),
+            "port":       int(s["SMTP_PORT"]),
+            "user":       str(s["SMTP_USER"]).strip(),
+            "password":   str(s["SMTP_PASSWORD"]),
+            "from_addr":  str(s.get("SMTP_FROM", s["SMTP_USER"])).strip(),
+            "recipients": [e.strip() for e in str(s["NOTIFY_EMAILS"]).split(",") if e.strip()],
+        }
+    except Exception:
+        return {}
+
+
+def _send_email_alert(subject: str, body: str) -> bool:
+    """Envía una notificación por correo usando la configuración SMTP de secrets.
+
+    Usa STARTTLS (puerto 587) si port != 465, o SSL directo si port == 465.
+    Falla silenciosamente si la configuración no está disponible.
+    Referencia: OWASP — no hardcodear credenciales; usar variables de entorno / secrets.
+    Devuelve True si el envío fue exitoso, False en caso contrario.
+    """
+    cfg = _get_email_cfg()
+    if not cfg or not cfg["recipients"]:
+        return False
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = cfg["from_addr"]
+    msg["To"]      = ", ".join(cfg["recipients"])
+    # Cuerpo texto plano (siempre) + HTML enriquecido
+    plain = body
+    html  = (
+        f"<html><body>"
+        f"<h2 style='color:#c0392b;'>\U0001f534 Alerta ReproTrace Basic 360</h2>"
+        f"<pre style='font-family:monospace;background:#f8f9fa;padding:12px;"  
+        f"border-left:4px solid #c0392b;'>{body}</pre>"
+        f"<hr/><small>Generado autom\u00e1ticamente por ReproTrace Basic 360 &mdash; "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}</small>"
+        f"</body></html>"
+    )
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
+    msg.attach(MIMEText(html,  "html",  "utf-8"))
+    try:
+        ctx = ssl.create_default_context()
+        if cfg["port"] == 465:
+            with smtplib.SMTP_SSL(cfg["host"], 465, context=ctx, timeout=10) as srv:
+                srv.login(cfg["user"], cfg["password"])
+                srv.sendmail(cfg["from_addr"], cfg["recipients"], msg.as_string())
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=10) as srv:
+                srv.ehlo()
+                srv.starttls(context=ctx)
+                srv.login(cfg["user"], cfg["password"])
+                srv.sendmail(cfg["from_addr"], cfg["recipients"], msg.as_string())
+        return True
+    except Exception:
+        return False
+
+
 def add_alert(code, batch, atype, sev, desc):
     execute("""INSERT INTO alerts(instrument_code,batch_code,alert_type,severity,description,status,created_at)
                VALUES(?,?,?,?,?,'Abierta',?)""",
             (code, batch, atype, sev, desc, datetime.now().isoformat()))
+    # Notificación por correo para alertas de ALTA severidad (Mejora T)
+    if sev == "Alta":
+        _send_email_alert(
+            subject=f"⚠️ [{sev}] {atype} — {code}/{batch}",
+            body=(
+                f"Tipo de alerta : {atype}\n"
+                f"Severidad      : {sev}\n"
+                f"Instrumental   : {code}\n"
+                f"Lote / carga   : {batch}\n"
+                f"Descripción    : {desc}\n"
+                f"Fecha/hora     : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"Acción recomendada:\n{AUTO_REC.get(atype, 'Revisar proceso y documentar causa raíz.')}"
+            ),
+        )
 
 def completed_stages(code, batch):
     df = query_df("SELECT stage FROM process_records WHERE instrument_code=? AND batch_code=?",(code,batch))
@@ -3957,6 +4047,52 @@ def config_module():
                 seed_demo_data()
                 audit(st.session_state["user"],"Limpieza demo","Config","Datos de demostración reiniciados")
                 st.success("Datos de prueba eliminados y reiniciados."); st.rerun()
+    # ─── Configuración de notificaciones por correo (Mejora T) ───────────────
+    st.markdown("---")
+    st.subheader("📧 Notificaciones por correo electrónico")
+    st.caption(
+        "Las alertas de severidad **Alta** se envían automáticamente por correo. "
+        "Configure las siguientes claves en **Settings → Secrets** (Streamlit Cloud) "
+        "o en `.streamlit/secrets.toml` en local:"
+    )
+    st.code(
+        '[secrets]\nSMTP_HOST     = "smtp.gmail.com"\nSMTP_PORT     = 587\n'
+        'SMTP_USER     = "ceye@ejemplo.com"\nSMTP_PASSWORD = "contraseña-de-aplicación"\n'
+        'SMTP_FROM     = "ceye@ejemplo.com"\nNOTIFY_EMAILS = "jefe@ejemplo.com, supervisor@ejemplo.com"',
+        language="toml",
+    )
+    st.info(
+        "⚠️ Use siempre una **contraseña de aplicación** (no la contraseña principal). "
+        "En Gmail: Cuenta → Seguridad → Contraseñas de aplicación. "
+        "Las credenciales nunca se almacenan en código (OWASP A02)."
+    )
+    cfg_now = _get_email_cfg()
+    if cfg_now:
+        st.success(
+            f"✅ SMTP configurado: **{cfg_now['host']}:{cfg_now['port']}** "
+            f"— Destinatarios: {', '.join(cfg_now['recipients'])}"
+        )
+        if st.button("📤 Enviar correo de prueba", key="test_email_btn"):
+            ok = _send_email_alert(
+                subject="✅ Prueba de notificación — ReproTrace Basic 360",
+                body=(
+                    "Este es un correo de prueba generado desde el módulo de Configuración.\n"
+                    f"Servidor : {cfg_now['host']}:{cfg_now['port']}\n"
+                    f"Remitente: {cfg_now['from_addr']}\n"
+                    f"Fecha    : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    "Si recibió este mensaje, las notificaciones están correctamente configuradas."
+                ),
+            )
+            if ok:
+                audit(st.session_state["user"], "Prueba email", "Config", "Correo de prueba enviado")
+                st.success("📨 Correo de prueba enviado correctamente.")
+            else:
+                st.error("❌ No se pudo enviar el correo. Verifique los secrets y el servidor SMTP.")
+    else:
+        st.warning(
+            "🔕 SMTP no configurado. Las notificaciones por correo están desactivadas. "
+            "Añada las claves indicadas arriba en Secrets para activarlas."
+        )
 
 # ─── Plan de pruebas ──────────────────────────────────────────────────────────
 def tests_module():
