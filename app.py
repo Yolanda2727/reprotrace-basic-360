@@ -784,6 +784,8 @@ AUTO_REC = {
     "Incumplimiento de protocolo":     "Detener el proceso en la etapa afectada, identificar y documentar la desviación, reevaluar con el supervisor y registrar en el plan de mejora antes de continuar.",
     "Paquete no apto":                 "Retirar inmediatamente el paquete del circuito. Evaluar si aplica reempaque o reprocesamiento completo según el estado del instrumental.",
     "Paquete dañado en entrega":       "No utilizar el instrumental. Reportar la novedad al servicio receptor, retirar del quirófano y reprocesar desde la etapa de inspección funcional.",
+    "Vencimiento próximo":             "Planificar uso o redistribución del lote antes de la fecha de vencimiento. Verificar condiciones de almacenamiento.",
+    "Paquete vencido":                 "Retirar inmediatamente del almacenamiento. No distribuir. Evaluar reprocesamiento completo desde Limpieza y descontaminación.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -973,6 +975,28 @@ def check_and_recommend():
         execute("""INSERT INTO improvement_plans(finding,risk_type,risk_level,corrective_action,state,registered_by,created_at)
                    VALUES(?,?,?,?,'Pendiente','sistema',?)""",
                 (finding, row["alert_type"], "Alta", rec, datetime.now().isoformat()))
+
+def _check_expiring_packages():
+    """Genera alertas automáticas por paquetes vencidos o próximos a vencer (≤ 7 días)."""
+    alm=query_df(
+        "SELECT instrument_code,batch_code,expiration_date FROM process_records "
+        "WHERE stage='Almacenamiento' AND expiration_date IS NOT NULL AND expiration_date!=''")
+    if alm.empty: return
+    today=date.today()
+    exist=query_df("SELECT instrument_code,batch_code,alert_type FROM alerts WHERE status='Abierta'")
+    dist=query_df("SELECT DISTINCT instrument_code,batch_code FROM process_records WHERE stage='Distribución'")
+    for _,row in alm.iterrows():
+        code,batch=row["instrument_code"],row["batch_code"]
+        if not dist.empty and ((dist["instrument_code"]==code)&(dist["batch_code"]==batch)).any(): continue
+        try: exp=date.fromisoformat(str(row["expiration_date"]))
+        except (ValueError,TypeError): continue
+        days=(exp-today).days
+        def _has(atype,c=code,b=batch):
+            return not exist.empty and ((exist["instrument_code"]==c)&(exist["batch_code"]==b)&(exist["alert_type"]==atype)).any()
+        if days<0 and not _has("Paquete vencido"):
+            add_alert(code,batch,"Paquete vencido","Alta",f"Paquete vencido desde {exp.isoformat()}. No distribuir. Reprocesar.")
+        elif 0<=days<=7 and not _has("Vencimiento próximo"):
+            add_alert(code,batch,"Vencimiento próximo","Media",f"Paquete vence en {days} día(s) ({exp.isoformat()}). Planificar uso o reprocesamiento.")
 
 # ─── Gráficas ─────────────────────────────────────────────────────────────────
 def fig_bytes(fig):
@@ -1376,6 +1400,26 @@ def dashboard():
             else: st.info(f"🟢 {msg}")
     else:
         st.success("Sin alertas abiertas.")
+    # Panel de paquetes próximos a vencer
+    _check_expiring_packages()
+    _alm_exp=query_df(
+        "SELECT instrument_code,batch_code,expiration_date FROM process_records "
+        "WHERE stage='Almacenamiento' AND expiration_date IS NOT NULL AND expiration_date!=''")
+    if not _alm_exp.empty:
+        _dist=query_df("SELECT DISTINCT instrument_code,batch_code FROM process_records WHERE stage='Distribución'")
+        _today=date.today(); _prox=[]
+        for _,_r in _alm_exp.iterrows():
+            if not _dist.empty and ((_dist["instrument_code"]==_r["instrument_code"])&(_dist["batch_code"]==_r["batch_code"])).any(): continue
+            try:
+                _e=date.fromisoformat(str(_r["expiration_date"])); _d=(_e-_today).days
+                if _d<=7: _prox.append({"Código":_r["instrument_code"],"Lote":_r["batch_code"],"Vence":str(_e),"Días":_d})
+            except (ValueError,TypeError): pass
+        if _prox:
+            st.subheader("📦 Paquetes próximos a vencer (≤ 7 días)")
+            for _row in sorted(_prox,key=lambda x:x["Días"]):
+                _msg=f"**{_row['Código']}** / Lote `{_row['Lote']}` — vence el **{_row['Vence']}**"
+                if _row["Días"]<0:   st.error(f"🔴 {_msg} (VENCIDO hace {abs(int(_row['Días']))} día(s))")
+                else:                st.warning(f"🟡 {_msg} ({int(_row['Días'])} día(s) restantes)")
 
 # ─── Registro de instrumental ─────────────────────────────────────────────────
 def instruments_module():
@@ -1550,6 +1594,7 @@ def process_module():
             if _val.empty or _val.iloc[0]["release_result"]!="Aprobado":
                 add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación de carga aprobada.")
         check_and_recommend()
+        _check_expiring_packages()
         st.success(f"✅ Etapa '{stage}' registrada.")
     st.dataframe(query_df("SELECT * FROM process_records ORDER BY created_at DESC LIMIT 30"),use_container_width=True)
 
@@ -1570,6 +1615,15 @@ def traceability_module():
     missing=[s for s in STAGES if s not in df["stage"].tolist()]
     if missing: st.error(f"🔴 Trazabilidad INCOMPLETA. Faltan: {', '.join(missing)}")
     else: st.success("🟢 Trazabilidad COMPLETA.")
+    _alm_row=df[df["stage"]=="Almacenamiento"]
+    if not _alm_row.empty:
+        _exp_val=_alm_row.iloc[-1]["expiration_date"]
+        if _exp_val and str(_exp_val) not in ("None","nan",""):
+            try:
+                _exp=date.fromisoformat(str(_exp_val)); _days=(_exp-date.today()).days
+                if _days<0:    st.error(f"🔴 PAQUETE VENCIDO: venció el {_exp_val} (hace {abs(_days)} día(s)). No distribuir.")
+                elif _days<=7: st.warning(f"🟡 VENCIMIENTO PRÓXIMO: {_days} día(s) restantes ({_exp_val}). Planificar uso urgente.")
+            except (ValueError,TypeError): pass
     st.subheader("Línea de tiempo")
     for _,r in df.iterrows():
         ic="✅" if r["complies"]=="Sí" else "❌"
