@@ -1004,6 +1004,23 @@ def check_and_recommend():
                    VALUES(?,?,?,?,'Pendiente','sistema',?)""",
                 (finding, row["alert_type"], "Alta", rec, datetime.now().isoformat()))
 
+def _calc_failure_rate(rec):
+    """
+    Tasa de reprocesamiento fallido:
+    % de lotes únicos con al menos un 'Rechazado' en Esterilización
+    o Validación / liberación de carga.
+    Base: lotes que al menos registraron Esterilización.
+    Referencia: AAMI ST79 §11 / OPS/OMS 2016 – indicador de calidad CEYE.
+    """
+    if rec.empty: return None, 0, 0
+    est = rec[rec["stage"].isin(["Esterilización","Validación / liberación de carga"])]
+    if est.empty: return None, 0, 0
+    lotes = est.groupby(["instrument_code","batch_code"])
+    total = len(lotes)
+    fallidos = sum(1 for _,g in lotes if (g["result"]=="Rechazado").any())
+    tasa = (fallidos/total*100) if total else 0
+    return round(tasa,1), fallidos, total
+
 def _check_expiring_packages():
     """Genera alertas automáticas por paquetes vencidos o próximos a vencer (≤ 7 días)."""
     alm=query_df(
@@ -2560,11 +2577,40 @@ def reports_module():
     rec=query_df("SELECT * FROM process_records")
     alerts=query_df("SELECT * FROM alerts")
     survey=query_df("SELECT * FROM staff_survey")
+    # ─ Fila 1: KPIs básicos
     c1,c2,c3,c4=st.columns(4)
     c1.metric("Registros",len(rec))
     c2.metric("Cumplimiento",f"{(rec['complies']=='Sí').mean()*100:.1f}%" if not rec.empty else "N/A")
     c3.metric("Tiempo promedio",f"{rec['duration_minutes'].mean():.1f} min" if not rec.empty else "N/A")
     c4.metric("Alertas abiertas",len(alerts[alerts["status"]=="Abierta"]) if not alerts.empty else 0)
+    # ─ Fila 2: KPI tasa de reprocesamiento fallido
+    _tasa,_fall,_tot=_calc_failure_rate(rec)
+    st.markdown("---")
+    st.subheader("🚫 Indicador de calidad: Tasa de reprocesamiento fallido")
+    st.caption("Referencia: AAMI ST79:2017 §11 / OPS-OMS Guía reprocesamiento 2016 / Circular 01/2016 Supersalud Colombia")
+    r1,r2,r3=st.columns(3)
+    r1.metric("Tasa de fallo (%)",
+              f"{_tasa}%" if _tasa is not None else "N/A",
+              help="Lotes con al menos un 'Rechazado' en Esterilización o Validación / liberación de carga.")
+    r2.metric("Lotes fallidos", _fall if _tasa is not None else "N/A")
+    r3.metric("Lotes evaluados", _tot if _tasa is not None else "N/A")
+    if _tasa is not None and _tasa>0:
+        # Tabla de lotes fallidos
+        _est=rec[rec["stage"].isin(["Esterilización","Validación / liberación de carga"])]
+        if not _est.empty:
+            _fail_df=(_est[_est["result"]=="Rechazado"]
+                      [["instrument_code","batch_code","stage","result","responsible","created_at","observations"]]
+                      .drop_duplicates(subset=["instrument_code","batch_code","stage"])
+                      .sort_values("created_at",ascending=False))
+            if not _fail_df.empty:
+                st.dataframe(_fail_df.rename(columns={
+                    "instrument_code":"Código","batch_code":"Lote","stage":"Etapa",
+                    "result":"Resultado","responsible":"Responsable",
+                    "created_at":"Fecha","observations":"Observaciones"}),
+                    use_container_width=True)
+    elif _tasa==0.0:
+        st.success("🟢 Sin lotes fallidos en Esterilización/Validación. Índice de calidad óptimo.")
+    st.markdown("---")
     st.subheader("Filtros")
     fc1,fc2,fc3=st.columns(3)
     fstage=fc1.selectbox("Etapa",["Todas"]+STAGES)
