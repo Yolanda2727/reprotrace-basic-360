@@ -781,6 +781,9 @@ AUTO_REC = {
     "Trazabilidad incompleta":         "Revisar registros por etapa, responsables, lote y fechas antes de liberar.",
     "Ciclo rechazado":                 "Reprocesar la carga, documentar causa y verificar parámetros del equipo.",
     "Limpieza no conforme":            "Rechazar etapa, identificar fallo, repetir con método adecuado y documentar.",
+    "Incumplimiento de protocolo":     "Detener el proceso en la etapa afectada, identificar y documentar la desviación, reevaluar con el supervisor y registrar en el plan de mejora antes de continuar.",
+    "Paquete no apto":                 "Retirar inmediatamente el paquete del circuito. Evaluar si aplica reempaque o reprocesamiento completo según el estado del instrumental.",
+    "Paquete dañado en entrega":       "No utilizar el instrumental. Reportar la novedad al servicio receptor, retirar del quirófano y reprocesar desde la etapa de inspección funcional.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -868,6 +871,18 @@ def init_db():
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT)""")
     c.commit(); c.close()
+
+def _migrate_db():
+    """Agrega columnas nuevas sin romper BD existente (migración segura)."""
+    c = connect()
+    for stmt in [
+        "ALTER TABLE alerts ADD COLUMN closing_reason TEXT",
+    ]:
+        try:
+            c.execute(stmt); c.commit()
+        except sqlite3.OperationalError:
+            pass  # columna ya existe
+    c.close()
 
 def seed_demo_data():
     demo = [
@@ -1484,6 +1499,14 @@ def process_module():
         if not ok: st.warning(f"⚠️ {msg} Se guarda como desviación académica.")
         s_dt=datetime.combine(sd,st_); e_dt=datetime.combine(ed,et)
         if e_dt<s_dt: st.error("Hora final no puede ser anterior a la inicial."); return
+        if stage=="Distribución":
+            _open=query_df(
+                "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta'",
+                (code,batch.strip()))
+            if not _open.empty:
+                st.error(f"🔴 BLOQUEO DE SEGURIDAD: El lote tiene {len(_open)} alerta(s) de riesgo ALTO abiertas. Ciérrelas en el módulo de Alertas antes de distribuir.")
+                for _,_a in _open.iterrows(): st.caption(f"• {_a['alert_type']}")
+                return
         dur=(e_dt-s_dt).total_seconds()/60
         execute("""INSERT INTO process_records(
             instrument_code,batch_code,stage,responsible,start_datetime,end_datetime,duration_minutes,complies,result,
@@ -1510,6 +1533,8 @@ def process_module():
         if bi_i=="No conforme": add_alert(code,batch.strip(),"Indicador biológico no conforme","Alta","Indicador biológico no conforme. Rechazar carga.")
         if ch_i=="No conforme": add_alert(code,batch.strip(),"Indicador no conforme","Alta","Indicador químico no conforme en validación.")
         if cl_c=="No conforme": add_alert(code,batch.strip(),"Limpieza no conforme","Alta",f"Limpieza no conforme. {cl_n}")
+        if stage=="Almacenamiento" and p_c in ["Dañado","Vencido"]: add_alert(code,batch.strip(),"Paquete no apto","Alta",f"Paquete en almacenamiento con condición '{p_c}'. No distribuir hasta verificar estado.")
+        if stage=="Distribución" and ps=="Dañado": add_alert(code,batch.strip(),"Paquete dañado en entrega","Alta",f"Paquete entregado con daño visible al servicio '{ds}'. Riesgo directo al paciente.")
         if stage=="Distribución":
             _val=query_df(
                 "SELECT release_result FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Validación / liberación de carga'",
@@ -1575,12 +1600,16 @@ def alerts_module():
     if not op.empty:
         st.subheader("Cerrar alerta")
         sel=st.selectbox("Alerta a cerrar",[f"{r.id} | {r.alert_type} | {r.instrument_code}/{r.batch_code}" for _,r in op.iterrows()])
+        reason=st.text_area("Justificación de cierre *",placeholder="Ej: Se reprocesó el lote y se verificó conformidad del indicador biológico.")
         if st.button("✅ Marcar como cerrada"):
-            aid=int(sel.split("|")[0].strip())
-            execute("UPDATE alerts SET status='Cerrada',closed_by=?,closed_at=? WHERE id=?",
-                    (st.session_state["user"],datetime.now().isoformat(),aid))
-            audit(st.session_state["user"],"Cerrar alerta","Alertas",f"ID:{aid}")
-            st.success("Alerta cerrada."); st.rerun()
+            if not reason.strip():
+                st.error("Debe ingresar una justificación antes de cerrar la alerta.")
+            else:
+                aid=int(sel.split("|")[0].strip())
+                execute("UPDATE alerts SET status='Cerrada',closed_by=?,closed_at=?,closing_reason=? WHERE id=?",
+                        (st.session_state["user"],datetime.now().isoformat(),reason.strip(),aid))
+                audit(st.session_state["user"],"Cerrar alerta","Alertas",f"ID:{aid} – {reason.strip()[:80]}")
+                st.success("Alerta cerrada."); st.rerun()
 
 # ─── Asistente IA – Plan de mejora ───────────────────────────────────────────
 # ─── Prompt base de Trace ────────────────────────────────────────────────────
@@ -2617,7 +2646,7 @@ def limitations_module():
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide",
                        initial_sidebar_state="collapsed")
-    init_db()
+    init_db(); _migrate_db()
     if not st.session_state.get("seeded"):
         seed_demo_data(); st.session_state["seeded"] = True
     if "login" not in st.session_state: st.session_state["login"]=False
