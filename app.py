@@ -870,6 +870,7 @@ def init_db():
         exposure_time REAL, load_number TEXT,
         physical_indicator TEXT, chemical_indicator TEXT,
         biological_indicator TEXT, release_result TEXT,
+        release_supervisor TEXT,
         storage_location TEXT, storage_date TEXT, package_condition TEXT,
         expiration_date TEXT,
         destination_service TEXT, delivery_responsible TEXT,
@@ -962,6 +963,7 @@ def _migrate_db():
     # ─ Nuevas columnas ──────────────────────────────────────────────────
     for stmt in [
         "ALTER TABLE alerts ADD COLUMN closing_reason TEXT",
+        "ALTER TABLE process_records ADD COLUMN release_supervisor TEXT",
     ]:
         try:
             c.execute(stmt); c.commit()
@@ -1685,6 +1687,7 @@ def process_module():
         st_e=cy_t=ld_n=""
         temp=pres=exp_t=0.0
         ph_i=ch_i=bi_i=rel=""
+        release_sup=""
         sl=s_d=p_c=ex_d=""
         ds=dr=rr=ps=""
         pat_id=pat_init=proc_type=or_room=""
@@ -1725,6 +1728,13 @@ def process_module():
             ch_i=b.selectbox("Indicador químico",["Conforme","No conforme","No aplica"])
             bi_i=c_.selectbox("Indicador biológico",["Conforme","No conforme","Pendiente","No aplica"])
             rel=st.selectbox("Resultado de liberación",["Aprobado","Rechazado","Pendiente"])
+            st.markdown("---")
+            st.markdown("**👥 Doble verificación — principio de cuatro ojos** *(AAMI ST79:2017 §12 / IAHCSMM)*")
+            st.caption("La liberación de carga requiere la firma de un segundo profesional independiente al responsable.")
+            release_sup=st.text_input("Supervisor / segundo verificador ✱",
+                                      placeholder="Nombre del supervisor o jefe de central",
+                                      key="release_sup",
+                                      help="Debe ser una persona distinta al responsable principal del registro.")
         elif stage=="Almacenamiento":
             a,b=st.columns(2)
             sl=a.text_input("Ubicación",placeholder="Estante A – Nivel 2")
@@ -1773,6 +1783,16 @@ def process_module():
         if stage=="Distribución" and not pat_id.strip():
             st.error("🔴 El ID del paciente es obligatorio para registrar la distribución "
                      "(ISO 13485:2016 §8.3 — trazabilidad postmercado)."); return
+        if stage=="Validación / liberación de carga":
+            if not release_sup.strip():
+                st.error("🔴 DOBLE VERIFICACIÓN REQUERIDA: Ingrese el nombre del supervisor o segundo verificador. "
+                         "La liberación de carga requiere firma de dos personas distintas "
+                         "(AAMI ST79:2017 §12 — principio de cuatro ojos)."); return
+            if release_sup.strip().lower()==resp.strip().lower():
+                st.error("🔴 DOBLE VERIFICACIÓN INVÁLIDA: El supervisor debe ser una persona "
+                         "diferente al responsable principal del registro. "
+                         "No se permite que una misma persona actúe como técnico y supervisor "
+                         "(AAMI ST79:2017 §12 / IAHCSMM)."); return
         # Detección de etapa duplicada
         _dup=query_df(
             "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
@@ -1827,16 +1847,19 @@ def process_module():
             inspection_status,
             package_type,chem_indicator_ext,chem_indicator_int,
             sterilizer_id,cycle_type,temperature,pressure,exposure_time,load_number,
-            physical_indicator,chemical_indicator,biological_indicator,release_result,
+            physical_indicator,chemical_indicator,biological_indicator,release_result,release_supervisor,
             storage_location,storage_date,package_condition,expiration_date,
             destination_service,delivery_responsible,reception_responsible,package_state_delivery,
             observations,registered_by,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (code,batch.strip(),stage,resp,s_dt.isoformat(),e_dt.isoformat(),dur,complies,result,
              r_ori,r_sta,r_qty,cl_m,cl_c,cl_n,ins_s,pk_t,ce_e,ce_i,
-             st_e,cy_t,temp,pres,exp_t,ld_n,ph_i,ch_i,bi_i,rel,
+             st_e,cy_t,temp,pres,exp_t,ld_n,ph_i,ch_i,bi_i,rel,release_sup.strip(),
              sl,s_d,p_c,ex_d,ds,dr,rr,ps,obs,st.session_state["user"],datetime.now().isoformat()))
         audit(st.session_state["user"],"Registro etapa","Proceso",f"{code}/{batch}/{stage}")
+        if stage=="Validación / liberación de carga" and rel=="Aprobado":
+            audit(st.session_state["user"],"Doble verificación — Liberación aprobada","Proceso",
+                  f"{code}/{batch} | Técnico: {resp} | Supervisor: {release_sup.strip()}")
         if not ok: add_alert(code,batch.strip(),"Secuencia incompleta","Media",msg)
         if complies=="No": add_alert(code,batch.strip(),"Incumplimiento de protocolo","Alta",f"No cumple en {stage}. {obs}")
         if result=="Rechazado": add_alert(code,batch.strip(),"Ciclo rechazado","Alta",f"Rechazado en {stage}.")
