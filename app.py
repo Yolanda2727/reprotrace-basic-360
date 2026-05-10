@@ -1143,7 +1143,24 @@ def generate_excel():
                 cw=max(len(str(col))+4, df[col].astype(str).str.len().max()+2 if not df.empty else 10)
                 s.set_column(i,i,min(cw,50))
             s.autofilter(sr,0,sr+len(df),len(df.columns)-1)
-        ws(ins,"Instrumental"); ws(rec,"Registros"); ws(alerts,"Alertas")
+        ws(ins,"Instrumental"); ws(rec,"Registros")
+        # Hoja Alertas: renombrar columnas clave para legibilidad
+        if not alerts.empty:
+            _al_export=alerts.rename(columns={
+                "id":"ID","instrument_code":"Código","batch_code":"Lote",
+                "alert_type":"Tipo de alerta","severity":"Severidad",
+                "description":"Descripción","status":"Estado",
+                "closed_by":"Cerrada por","closed_at":"Fecha de cierre",
+                "closing_reason":"Justificación de cierre","created_at":"Fecha creación"})
+            ws(_al_export,"Alertas")
+            # Hoja exclusiva de alertas cerradas con justificación
+            _cerradas=_al_export[_al_export["Estado"]=="Cerrada"].copy()
+            if not _cerradas.empty:
+                ws(_cerradas[["ID","Código","Lote","Tipo de alerta","Severidad",
+                               "Descripción","Cerrada por","Fecha de cierre",
+                               "Justificación de cierre"]],"Alertas_Cerradas")
+        else:
+            ws(alerts,"Alertas")
         ws(survey,"Encuestas"); ws(plans,"Plan_Mejora")
         if not rec.empty:
             t=rec.groupby(["instrument_code","batch_code"])["stage"].apply(list).reset_index()
@@ -1162,6 +1179,10 @@ def generate_excel():
                 ("Total alertas",len(alerts)),
                 ("Alertas abiertas",len(alerts[alerts['status']=='Abierta']) if not alerts.empty else 0),
                 ("Alertas riesgo Alto",len(alerts[alerts['severity']=='Alta']) if not alerts.empty else 0),
+                ("Alertas cerradas con justificación",
+                 len(alerts[(alerts['status']=='Cerrada')&(alerts.get('closing_reason','').fillna('')!='')]) if not alerts.empty and 'closing_reason' in alerts.columns else 0),
+                ("Tasa de reprocesamiento fallido (%)",
+                 f"{_calc_failure_rate(rec)[0]}" if not rec.empty else "N/A"),
             ]:
                 si.write(r,0,k); si.write(r,1,v); r+=1
         si.set_column(0,0,40); si.set_column(1,1,20)
@@ -1812,6 +1833,40 @@ def alerts_module():
                         (st.session_state["user"],datetime.now().isoformat(),reason.strip(),aid))
                 audit(st.session_state["user"],"Cerrar alerta","Alertas",f"ID:{aid} – {reason.strip()[:80]}")
                 st.success("Alerta cerrada."); st.rerun()
+    # ─ Historial de alertas cerradas con justificación
+    _cerr=query_df(
+        "SELECT id,instrument_code,batch_code,alert_type,severity,description,closed_by,closed_at,closing_reason "
+        "FROM alerts WHERE status='Cerrada' ORDER BY closed_at DESC")
+    if not _cerr.empty:
+        st.subheader("📜 Historial de alertas cerradas")
+        _cerr_show=_cerr.rename(columns={
+            "id":"ID","instrument_code":"Código","batch_code":"Lote",
+            "alert_type":"Tipo","severity":"Severidad","description":"Descripción",
+            "closed_by":"Cerrada por","closed_at":"Fecha cierre",
+            "closing_reason":"Justificación"})
+        _sin_just=_cerr[_cerr["closing_reason"].isna()|(~_cerr["closing_reason"].astype(str).str.strip().astype(bool))]
+        if not _sin_just.empty:
+            st.warning(f"🟡 {len(_sin_just)} alerta(s) cerrada(s) sin justificación registrada (registros anteriores a esta mejora).")
+        st.dataframe(_cerr_show,use_container_width=True)
+        # Descarga exclusiva de cerradas
+        _buf=io.BytesIO()
+        with pd.ExcelWriter(_buf,engine="xlsxwriter") as _w:
+            _wb=_w.book
+            _hf=_wb.add_format({"bold":True,"bg_color":"#1F4E79","font_color":"white","border":1})
+            _tf=_wb.add_format({"bold":True,"font_size":13})
+            _now=datetime.now().strftime("%Y-%m-%d %H:%M")
+            _cerr_show.to_excel(_w,sheet_name="Alertas_Cerradas",index=False,startrow=2)
+            _s=_w.sheets["Alertas_Cerradas"]
+            _s.write(0,0,f"{APP_NAME} – Alertas cerradas – {_now}",_tf)
+            for _i,_c in enumerate(_cerr_show.columns):
+                _s.write(2,_i,_c,_hf)
+                _cw=max(len(str(_c))+4,_cerr_show[_c].astype(str).str.len().max()+2 if not _cerr_show.empty else 10)
+                _s.set_column(_i,_i,min(_cw,60))
+            _s.autofilter(2,0,2+len(_cerr_show),len(_cerr_show.columns)-1)
+        _buf.seek(0)
+        st.download_button("📥 Descargar alertas cerradas (Excel)",_buf.read(),
+                           file_name=f"alertas_cerradas_{date.today()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ─── Asistente IA – Plan de mejora ───────────────────────────────────────────
 # ─── Prompt base de Trace ────────────────────────────────────────────────────
