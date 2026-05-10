@@ -847,6 +847,7 @@ AUTO_REC = {
     "Ciclos próximos al límite":                  "Planificar reemplazo del instrumental. Está próximo al límite de ciclos del fabricante (ISO 17664:2017). No descartarlo aún, pero gestionar adquisición de reemplazo.",
     "Equipo sin calibración vigente":             "BLOQUEAR uso del equipo. No esterilizar hasta obtener certificado de calibración vigente. Contactar entidad metrológica acreditada (ISO 17665-1 / ISO 15883-1 / Res. 4816/2008).",
     "Calibración de equipo próxima a vencer":     "Programar calibración antes del vencimiento. El equipo puede seguir operando, pero debe gestionarse la renovación del certificado (ISO 17665-1 §10 / AAMI ST79:2017 §12.4).",
+    "No conformidad abierta":                     "Investigar causa raíz, registrar acción correctiva y preventiva en el módulo de No Conformidades. Verificar eficacia y cerrar con evidencia. (ISO 13485:2016 §8.7 / Res. 4816/2008)",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -1001,6 +1002,28 @@ def init_db():
         created_at TEXT)""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_equip_id       ON equipment_calibration(equipment_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_next_cal_date  ON equipment_calibration(next_calibration_date)")
+    # nonconformities: no conformidades vinculadas a alertas (ISO 13485:2016 §8.7 / Res. 4816/2008)
+    cur.execute("""CREATE TABLE IF NOT EXISTS nonconformities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_id       INTEGER,
+        instrument_code TEXT,
+        batch_code      TEXT,
+        nc_type        TEXT NOT NULL,
+        description    TEXT NOT NULL,
+        root_cause     TEXT,
+        corrective_action TEXT,
+        preventive_action TEXT,
+        responsible    TEXT,
+        due_date       TEXT,
+        status         TEXT NOT NULL DEFAULT 'Abierta',
+        closed_by      TEXT,
+        closed_at      TEXT,
+        closure_evidence TEXT,
+        registered_by  TEXT,
+        created_at     TEXT)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_alert_id      ON nonconformities(alert_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_code_batch    ON nonconformities(instrument_code, batch_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nc_status        ON nonconformities(status)")
     c.commit(); c.close()
 
 def _migrate_db():
@@ -1045,6 +1068,24 @@ def _migrate_db():
         observations TEXT,
         registered_by TEXT,
         created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS nonconformities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_id       INTEGER,
+        instrument_code TEXT,
+        batch_code      TEXT,
+        nc_type        TEXT NOT NULL,
+        description    TEXT NOT NULL,
+        root_cause     TEXT,
+        corrective_action TEXT,
+        preventive_action TEXT,
+        responsible    TEXT,
+        due_date       TEXT,
+        status         TEXT NOT NULL DEFAULT 'Abierta',
+        closed_by      TEXT,
+        closed_at      TEXT,
+        closure_evidence TEXT,
+        registered_by  TEXT,
+        created_at     TEXT)""")
     c.commit()
     # ─ Nuevas columnas ──────────────────────────────────────────────────
     for stmt in [
@@ -1081,6 +1122,9 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_re_status     ON recall_events(status)",
         "CREATE INDEX IF NOT EXISTS idx_ec_equip_id       ON equipment_calibration(equipment_id)",
         "CREATE INDEX IF NOT EXISTS idx_ec_next_cal_date  ON equipment_calibration(next_calibration_date)",
+        "CREATE INDEX IF NOT EXISTS idx_nc_alert_id      ON nonconformities(alert_id)",
+        "CREATE INDEX IF NOT EXISTS idx_nc_code_batch    ON nonconformities(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_nc_status        ON nonconformities(status)",
     ]
     for stmt in idx_stmts:
         try:
@@ -2673,6 +2717,60 @@ def alerts_module():
         st.download_button("📥 Descargar alertas cerradas (Excel)",_buf.read(),
                            file_name=f"alertas_cerradas_{date.today()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # ─ Generar NC desde alerta abierta (Mejora R) ─────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Generar no conformidad desde alerta")
+    st.caption("Referencia: ISO 13485:2016 §8.7 — Control de salidas no conformes / Res. 4816/2008 MinSalud Colombia")
+    op_nc = query_df("SELECT id,alert_type,severity,instrument_code,batch_code FROM alerts WHERE status='Abierta' ORDER BY created_at DESC")
+    if op_nc.empty:
+        st.info("No hay alertas abiertas en este momento.")
+    else:
+        sel_nc = st.selectbox(
+            "Seleccionar alerta de origen",
+            [f"{r.id} | [{r.severity}] {r.alert_type} – {r.instrument_code}/{r.batch_code}" for _, r in op_nc.iterrows()],
+            key="nc_alert_sel")
+        if sel_nc:
+            _nc_aid = int(sel_nc.split("|")[0].strip())
+            _nc_row = op_nc[op_nc["id"] == _nc_aid].iloc[0]
+            _nc_existing = query_df(
+                "SELECT id FROM nonconformities WHERE alert_id=? AND status='Abierta'", (_nc_aid,))
+            if not _nc_existing.empty:
+                st.info(f"Ya existe una no conformidad abierta vinculada a esta alerta (NC #{_nc_existing.iloc[0]['id']}).")
+            else:
+                with st.form("nc_from_alert_form", clear_on_submit=True):
+                    nc_type = st.selectbox("Tipo de no conformidad",
+                        ["Proceso","Instrumental","Equipo","Personal","Documentación","Infraestructura","Otro"])
+                    nc_desc = st.text_area("Descripción de la no conformidad *",
+                        value=f"Alerta [{_nc_row['severity']}] '{_nc_row['alert_type']}' en "
+                              f"{_nc_row['instrument_code']}/{_nc_row['batch_code']}.",
+                        height=90)
+                    nc_cause = st.text_area("Causa raíz (análisis preliminar)", height=80,
+                        placeholder="Ej: Fallo en validación del ciclo por temperatura insuficiente.")
+                    nc_corr = st.text_area("Acción correctiva propuesta", height=80,
+                        placeholder="Ej: Rechazar carga, reprocesar y calibrar el equipo.")
+                    nc_prev = st.text_area("Acción preventiva propuesta", height=80,
+                        placeholder="Ej: Establecer verificación diaria de parámetros del autoclave.")
+                    c1nc, c2nc = st.columns(2)
+                    nc_resp = c1nc.text_input("Responsable de cierre", placeholder="Nombre del responsable")
+                    nc_due  = c2nc.date_input("Fecha límite de cierre", value=date.today() + timedelta(days=15))
+                    nc_sub  = st.form_submit_button("💾 Registrar no conformidad")
+                if nc_sub:
+                    if not nc_desc.strip():
+                        st.error("La descripción es obligatoria.")
+                    else:
+                        execute("""INSERT INTO nonconformities
+                            (alert_id,instrument_code,batch_code,nc_type,description,
+                             root_cause,corrective_action,preventive_action,
+                             responsible,due_date,status,registered_by,created_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,'Abierta',?,?)""",
+                            (_nc_aid, str(_nc_row["instrument_code"]), str(_nc_row["batch_code"]),
+                             nc_type, nc_desc.strip(), nc_cause.strip(), nc_corr.strip(),
+                             nc_prev.strip(), nc_resp.strip(), nc_due.isoformat(),
+                             st.session_state["user"], datetime.now().isoformat()))
+                        audit(st.session_state["user"], "NC registrada", "No conformidades",
+                              f"Alerta #{_nc_aid} – {nc_type} – {_nc_row['instrument_code']}/{_nc_row['batch_code']}")
+                        st.success("✅ No conformidad registrada y vinculada a la alerta.")
+                        st.rerun()
 
 # ─── Asistente IA – Plan de mejora ───────────────────────────────────────────
 # ─── Prompt base de Trace ────────────────────────────────────────────────────
@@ -3875,6 +3973,143 @@ def calibration_module():
                 st.success("🟢 Todos los equipos tienen calibración vigente con más de 30 días restantes.")
 
 
+# ─── No conformidades (Mejora R) ──────────────────────────────────────────────
+def nonconformities_module():
+    st.header("📋 No conformidades")
+    st.caption(
+        "Referencia: ISO 13485:2016 §8.7 — Control de salidas no conformes / "
+        "ISO 9001:2015 §10.2 / Resolución 4816/2008 MinSalud Colombia"
+    )
+    user = st.session_state["user"]
+
+    tab_list, tab_close, tab_kpi = st.tabs(["📂 Listado", "✅ Cerrar NC", "📊 Indicadores"])
+
+    # ── Tab 1: Listado ────────────────────────────────────────────────────────
+    with tab_list:
+        df_nc = query_df(
+            "SELECT nc.id, nc.alert_id, nc.instrument_code, nc.batch_code, nc.nc_type, "
+            "nc.description, nc.root_cause, nc.corrective_action, nc.preventive_action, "
+            "nc.responsible, nc.due_date, nc.status, nc.closed_by, nc.closed_at, "
+            "nc.closure_evidence, nc.registered_by, nc.created_at, "
+            "al.alert_type, al.severity "
+            "FROM nonconformities nc "
+            "LEFT JOIN alerts al ON nc.alert_id = al.id "
+            "ORDER BY nc.created_at DESC")
+        if df_nc.empty:
+            st.info("No hay no conformidades registradas. Puedes crearlas desde el módulo de Alertas.")
+        else:
+            # Semáforo global
+            abiertas  = df_nc[df_nc["status"] == "Abierta"]
+            vencidas  = abiertas[abiertas["due_date"].apply(
+                lambda d: bool(d) and date.fromisoformat(str(d)) < date.today()
+                if d and str(d).strip() else False)]
+            if not vencidas.empty:
+                st.error(f"🔴 {len(vencidas)} no conformidad(es) VENCIDA(S) sin cerrar.")
+            if not abiertas.empty:
+                st.warning(f"🟡 {len(abiertas)} no conformidad(es) abiertas.")
+            else:
+                st.success("🟢 Todas las no conformidades están cerradas.")
+
+            # Filtros
+            f1, f2 = st.columns(2)
+            fst = f1.selectbox("Estado", ["Todas", "Abierta", "Cerrada"], key="nc_fst")
+            ftyp = f2.selectbox("Tipo", ["Todos"] + sorted(df_nc["nc_type"].dropna().unique().tolist()), key="nc_ftyp")
+            view = df_nc.copy()
+            if fst != "Todas":  view = view[view["status"] == fst]
+            if ftyp != "Todos": view = view[view["nc_type"] == ftyp]
+
+            st.dataframe(
+                view.rename(columns={
+                    "id": "NC #", "alert_id": "Alerta origen", "instrument_code": "Código",
+                    "batch_code": "Lote", "nc_type": "Tipo", "description": "Descripción",
+                    "root_cause": "Causa raíz", "corrective_action": "Acción correctiva",
+                    "preventive_action": "Acción preventiva", "responsible": "Responsable",
+                    "due_date": "Fecha límite", "status": "Estado",
+                    "closed_by": "Cerrada por", "closed_at": "Fecha cierre",
+                    "closure_evidence": "Evidencia cierre",
+                    "alert_type": "Tipo alerta", "severity": "Severidad alerta",
+                }).drop(columns=["registered_by", "created_at"], errors="ignore"),
+                use_container_width=True,
+                hide_index=True,
+            )
+            # Exportar
+            _buf_nc = __import__("io").BytesIO()
+            with pd.ExcelWriter(_buf_nc, engine="openpyxl") as _wr:
+                view.to_excel(_wr, index=False, sheet_name="No conformidades")
+            st.download_button(
+                "📥 Exportar no conformidades (Excel)",
+                data=_buf_nc.getvalue(),
+                file_name=f"no_conformidades_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    # ── Tab 2: Cerrar NC ──────────────────────────────────────────────────────
+    with tab_close:
+        st.subheader("Cerrar no conformidad")
+        open_nc = query_df(
+            "SELECT id, nc_type, description, instrument_code, batch_code, due_date "
+            "FROM nonconformities WHERE status='Abierta' ORDER BY due_date ASC")
+        if open_nc.empty:
+            st.success("🟢 No hay no conformidades abiertas.")
+        else:
+            sel_c = st.selectbox(
+                "Seleccionar NC a cerrar",
+                [f"NC #{r.id} | {r.nc_type} | {r.instrument_code}/{r.batch_code} | vence {r.due_date}"
+                 for _, r in open_nc.iterrows()],
+                key="nc_close_sel")
+            if sel_c:
+                _close_id = int(sel_c.split("|")[0].replace("NC #", "").strip())
+                with st.form("nc_close_form", clear_on_submit=True):
+                    evidence = st.text_area(
+                        "Evidencia de cierre *",
+                        height=100,
+                        placeholder="Ej: Se reprocesó el lote, se verificó conformidad del IB y se capacitó al personal.")
+                    submitted_c = st.form_submit_button("✅ Cerrar NC")
+                if submitted_c:
+                    if not evidence.strip():
+                        st.error("La evidencia de cierre es obligatoria (ISO 13485:2016 §8.7).")
+                    else:
+                        execute(
+                            "UPDATE nonconformities SET status='Cerrada',closed_by=?,closed_at=?,closure_evidence=? WHERE id=?",
+                            (user, datetime.now().isoformat(), evidence.strip(), _close_id))
+                        audit(user, "NC cerrada", "No conformidades",
+                              f"NC #{_close_id} cerrada con evidencia: {evidence.strip()[:80]}")
+                        st.success(f"NC #{_close_id} cerrada correctamente.")
+                        st.rerun()
+
+    # ── Tab 3: Indicadores ────────────────────────────────────────────────────
+    with tab_kpi:
+        st.subheader("Indicadores de no conformidades")
+        st.caption("Referencia: ISO 13485:2016 §8.7 / AAMI ST79:2017 §11 / OPS-OMS Guía CEyE 2016")
+        df_all = query_df("SELECT nc_type, status, created_at, due_date FROM nonconformities")
+        if df_all.empty:
+            st.info("Aún no hay no conformidades registradas.")
+        else:
+            total  = len(df_all)
+            n_open = int((df_all["status"] == "Abierta").sum())
+            n_clos = total - n_open
+            n_venc = int(df_all[df_all["status"] == "Abierta"]["due_date"].apply(
+                lambda d: bool(d) and date.fromisoformat(str(d)) < date.today()
+                if d and str(d).strip() else False).sum())
+            pct_cl = round(n_clos / total * 100, 1) if total else 0.0
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total NC", total)
+            k2.metric("Abiertas", n_open)
+            k3.metric("Cerradas", n_clos, f"{pct_cl}%")
+            k4.metric("Vencidas", n_venc, delta_color="inverse")
+
+            # Gráfica por tipo
+            plt = _get_plt()
+            fig_r, ax_r = plt.subplots(figsize=(6, 3))
+            counts = df_all.groupby("nc_type").size().sort_values(ascending=True)
+            ax_r.barh(counts.index, counts.values, color="#1F4E79", height=0.5)
+            ax_r.set_xlabel("Cantidad")
+            ax_r.set_title("No conformidades por tipo", fontsize=9)
+            fig_r.tight_layout()
+            st.pyplot(fig_r)
+            plt.close(fig_r)
+
+
 # ─── Limitaciones ─────────────────────────────────────────────────────────────
 def limitations_module():
     st.header("11. Limitaciones del prototipo")
@@ -3911,7 +4146,7 @@ def main():
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
         "🔍 Consulta de trazabilidad","🚨 Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
-        "📊 Reportes e indicadores","🔩 Calibración de equipos","📝 Encuesta de percepción",
+        "📊 Reportes e indicadores","🔩 Calibración de equipos","📋 No conformidades","📝 Encuesta de percepción",
         "🔒 Auditoría de cambios","⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
     ]
     menu=st.sidebar.radio("Menú",MENU)
@@ -3924,8 +4159,9 @@ def main():
         "🔔 Alertas y novedades":alerts_module,
         "📌 Plan de mejora":improvement_module,
         "📊 Reportes e indicadores":reports_module,
-        "� Calibración de equipos":calibration_module,
-        "�📝 Encuesta de percepción":survey_module,
+        "🔩 Calibración de equipos":calibration_module,
+        "📋 No conformidades":nonconformities_module,
+        "📝 Encuesta de percepción":survey_module,
         "🔒 Auditoría de cambios":audit_module,
         "⚙️ Configuración y respaldo":config_module,
         "✅ Plan de pruebas":tests_module,
