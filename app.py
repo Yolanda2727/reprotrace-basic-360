@@ -909,6 +909,18 @@ def init_db():
         role TEXT NOT NULL DEFAULT 'Personal de central',
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT)""")
+    # ─ Vinculación instrumental → paciente (ISO 13485:2016 §8.3 / Res. 4816/2008) ─
+    cur.execute("""CREATE TABLE IF NOT EXISTS patient_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_code TEXT NOT NULL,
+        batch_code TEXT NOT NULL,
+        patient_id TEXT NOT NULL,
+        patient_initials TEXT,
+        procedure_type TEXT,
+        operating_room TEXT,
+        delivery_date TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
     # ─ Índices de rendimiento ──────────────────────────────────────────────
     # process_records: consultas más frecuentes por lote/instrumento y etapa
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_code_batch  ON process_records(instrument_code, batch_code)")
@@ -926,11 +938,27 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_aud_created_at ON audit_log(created_at)")
     # improvement_plans: filtro por estado pendiente
     cur.execute("CREATE INDEX IF NOT EXISTS idx_imp_state      ON improvement_plans(state)")
+    # patient_deliveries: trazabilidad paciente y búsqueda recall
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pd_code_batch  ON patient_deliveries(instrument_code, batch_code)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pd_patient_id  ON patient_deliveries(patient_id)")
     c.commit(); c.close()
 
 def _migrate_db():
-    """Agrega columnas e índices nuevos sin romper BD existente (migración segura)."""
+    """Agrega tablas, columnas e índices nuevos sin romper BD existente (migración segura)."""
     c = connect()
+    # ─ Nuevas tablas (IF NOT EXISTS = idempotente) ───────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS patient_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_code TEXT NOT NULL,
+        batch_code TEXT NOT NULL,
+        patient_id TEXT NOT NULL,
+        patient_initials TEXT,
+        procedure_type TEXT,
+        operating_room TEXT,
+        delivery_date TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
+    c.commit()
     # ─ Nuevas columnas ──────────────────────────────────────────────────
     for stmt in [
         "ALTER TABLE alerts ADD COLUMN closing_reason TEXT",
@@ -953,6 +981,8 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_aud_module     ON audit_log(module)",
         "CREATE INDEX IF NOT EXISTS idx_aud_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_imp_state      ON improvement_plans(state)",
+        "CREATE INDEX IF NOT EXISTS idx_pd_code_batch  ON patient_deliveries(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_pd_patient_id  ON patient_deliveries(patient_id)",
     ]
     for stmt in idx_stmts:
         try:
@@ -1214,6 +1244,19 @@ def generate_excel():
             t["completadas"]=t["stage"].apply(len)
             t["estado"]=t["stage"].apply(lambda s:"Completa" if set(STAGES).issubset(set(s)) else "Incompleta")
             t.drop(columns=["stage"],inplace=True); ws(t,"Trazabilidad")
+        # Hoja Vinculación Paciente
+        pd_data=query_df("SELECT * FROM patient_deliveries")
+        if not pd_data.empty:
+            ws(pd_data.rename(columns={
+                "id":"ID","instrument_code":"Código","batch_code":"Lote",
+                "patient_id":"ID Paciente","patient_initials":"Iniciales",
+                "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+                "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+                "created_at":"Fecha creación"}),"Vinculacion_Paciente")
+        else:
+            ws(pd.DataFrame(columns=["ID","Código","Lote","ID Paciente","Iniciales",
+                                     "Procedimiento","Quirófano/Sala","Fecha entrega",
+                                     "Registrado por","Fecha creación"]),"Vinculacion_Paciente")
         si=wb.add_worksheet("Indicadores")
         si.write(0,0,f"{APP_NAME} – Indicadores – {now}",tf)
         si.write(2,0,"Indicador",hf); si.write(2,1,"Valor",hf)
@@ -1644,6 +1687,7 @@ def process_module():
         ph_i=ch_i=bi_i=rel=""
         sl=s_d=p_c=ex_d=""
         ds=dr=rr=ps=""
+        pat_id=pat_init=proc_type=or_room=""
 
         if stage=="Recepción":
             r_ori=st.text_input("Servicio de origen")
@@ -1693,6 +1737,19 @@ def process_module():
             dr=b.text_input("Responsable de entrega")
             rr=a.text_input("Responsable de recepción")
             ps=b.selectbox("Estado del paquete al entregar",["Íntegro","Dañado"])
+            st.markdown("---")
+            st.markdown("**👤 Vinculación con paciente** *(ISO 13485:2016 §8.3 — trazabilidad postmercado)*")
+            pa1,pa2=st.columns(2)
+            pat_id=pa1.text_input("ID paciente / Historia clínica ✱",placeholder="HC-2026-00123",
+                                  help="Requerido. Número de historia clínica o identificación del paciente.")
+            pat_init=pa2.text_input("Iniciales del paciente",placeholder="J.G.R.",
+                                    help="Opcional — para preservar privacidad en reportes.")
+            pa3,pa4=st.columns(2)
+            proc_type=pa3.selectbox("Tipo de procedimiento",
+                ["Cirugía general","Ortopedia","Ginecología","Urología",
+                 "Cardiovascular","Neurocirugía","Laparoscopia","Otorrinolaringología",
+                 "Oftalmología","Urgencias","Otro"])
+            or_room=pa4.text_input("Quirófano / Sala",placeholder="Quirófano 3")
 
         obs=st.text_area("Observaciones generales")
         # Advertencia de etapa ya registrada (visible antes de enviar)
@@ -1713,6 +1770,9 @@ def process_module():
         if not BATCH_PATTERN.match(batch.strip()):
             st.error(f"🔴 Formato de lote inválido: '{batch.strip()}'. {BATCH_HINT}")
             return
+        if stage=="Distribución" and not pat_id.strip():
+            st.error("🔴 El ID del paciente es obligatorio para registrar la distribución "
+                     "(ISO 13485:2016 §8.3 — trazabilidad postmercado)."); return
         # Detección de etapa duplicada
         _dup=query_df(
             "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
@@ -1807,6 +1867,18 @@ def process_module():
                 add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación de carga aprobada.")
         check_and_recommend()
         _check_expiring_packages()
+        # ─ Vinculación instrumental → paciente (ISO 13485:2016 §8.3) ──────────────
+        if stage=="Distribución" and pat_id.strip():
+            execute("""
+                INSERT INTO patient_deliveries
+                    (instrument_code,batch_code,patient_id,patient_initials,
+                     procedure_type,operating_room,delivery_date,registered_by,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (code, batch.strip(), pat_id.strip(), pat_init.strip(),
+                 proc_type, or_room.strip(), s_dt.isoformat()[:10],
+                 st.session_state["user"], datetime.now().isoformat()))
+            audit(st.session_state["user"],"Vinculación paciente","Proceso",
+                  f"{code}/{batch.strip()} → Paciente {pat_id.strip()}, {proc_type}, {or_room.strip()}")
         st.success(f"✅ Etapa '{stage}' registrada.")
     st.dataframe(query_df("SELECT * FROM process_records ORDER BY created_at DESC LIMIT 30"),use_container_width=True)
 
@@ -1850,6 +1922,110 @@ def traceability_module():
             elif sev=="Media": st.warning(f"🟡 {msg}")
             else: st.info(f"🟢 {msg}")
     else: st.success("Sin alertas para este lote.")
+    # ─ Pacientes vinculados ───────────────────────────────────────────────────
+    st.subheader("👤 Pacientes vinculados a este lote")
+    pd_df=query_df(
+        "SELECT patient_id,patient_initials,procedure_type,operating_room,delivery_date,registered_by,created_at "
+        "FROM patient_deliveries WHERE instrument_code=? AND batch_code=? ORDER BY created_at",
+        (code,batch))
+    if not pd_df.empty:
+        st.info(f"ℹ️ {len(pd_df)} paciente(s) recibieron instrumental de este lote.")
+        st.dataframe(pd_df.rename(columns={
+            "patient_id":"ID Paciente","patient_initials":"Iniciales",
+            "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+            "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+            "created_at":"Creado en"}), use_container_width=True)
+        if not al.empty and len(al[al["severity"]=="Alta"])>0:
+            st.error("🚨 Este lote tiene alertas de riesgo ALTO. Evalúe activar protocolo de retiro de lote "
+                     "en el módulo '🚨 Retiro de lote (Recall)'.")
+    else:
+        st.info("Sin vinculación de pacientes registrada para este lote.")
+
+# ─── Retiro de lote / Recall ──────────────────────────────────────────────────
+def recall_module():
+    st.header("🚨 Retiro de lote (Recall) / Búsqueda por paciente")
+    st.warning(
+        "⚠️ Use esta función cuando se detecte una No Conformidad post-distribución que pueda "
+        "afectar la seguridad del paciente. Permite identificar todos los pacientes expuestos "
+        "a un lote específico y activar el protocolo de notificación. "
+        "**Referencia normativa:** ISO 13485:2016 §8.3 — Resolución 4816/2008 MinSalud Colombia.")
+    tab1, tab2 = st.tabs(["🔍 Búsqueda por lote", "👤 Búsqueda por paciente"])
+    with tab1:
+        st.subheader("Pacientes expuestos a un lote específico")
+        rc1,rc2=st.columns(2)
+        r_code=rc1.text_input("Código del instrumental",key="rc_code",placeholder="IQ-001")
+        r_batch=rc2.text_input("Número de lote",key="rc_batch",placeholder="LOTE-2026-001")
+        if st.button("🔍 Buscar pacientes expuestos",key="rc_search"):
+            if not r_code.strip() or not r_batch.strip():
+                st.error("Ingrese código de instrumental y número de lote."); return
+            pd_df=query_df(
+                "SELECT patient_id,patient_initials,procedure_type,operating_room,"
+                "delivery_date,registered_by,created_at "
+                "FROM patient_deliveries WHERE instrument_code=? AND batch_code=? ORDER BY created_at",
+                (r_code.strip(),r_batch.strip()))
+            al_df=query_df(
+                "SELECT alert_type,severity,description,status,created_at FROM alerts "
+                "WHERE instrument_code=? AND batch_code=? ORDER BY severity,created_at",
+                (r_code.strip(),r_batch.strip()))
+            st.markdown("---")
+            if not al_df.empty:
+                alta_cnt=len(al_df[al_df["severity"]=="Alta"])
+                if alta_cnt>0:
+                    st.error(f"🔴 **Lote con {alta_cnt} alerta(s) de riesgo ALTO**")
+                st.dataframe(al_df.rename(columns={
+                    "alert_type":"Tipo de alerta","severity":"Severidad",
+                    "description":"Descripción","status":"Estado","created_at":"Fecha"}),
+                    use_container_width=True)
+            else:
+                st.success("✅ No se encontraron alertas para este lote.")
+            if pd_df.empty:
+                st.info("No hay pacientes vinculados a este lote.")
+            else:
+                n=len(pd_df)
+                st.error(f"🚨 **{n} paciente(s) expuesto(s)** a este lote. "
+                         "Activar protocolo institucional de notificación.")
+                st.dataframe(pd_df.rename(columns={
+                    "patient_id":"ID Paciente","patient_initials":"Iniciales",
+                    "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+                    "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+                    "created_at":"Creado en"}), use_container_width=True)
+                # Descarga Excel del recall
+                out=io.BytesIO()
+                with pd.ExcelWriter(out,engine="xlsxwriter") as w:
+                    pd_df.to_excel(w,sheet_name="Pacientes_expuestos",index=False)
+                    if not al_df.empty:
+                        al_df.to_excel(w,sheet_name="Alertas_lote",index=False)
+                out.seek(0)
+                st.download_button(
+                    "📥 Descargar listado de recall (Excel)",
+                    data=out.read(),
+                    file_name=f"recall_{r_code.strip()}_{r_batch.strip()}_{date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                audit(st.session_state["user"],"Consulta recall","Recall",
+                      f"{r_code.strip()}/{r_batch.strip()} — {n} paciente(s) expuesto(s)")
+    with tab2:
+        st.subheader("Historial de lotes recibidos por un paciente")
+        p_id=st.text_input("ID del paciente / Historia clínica",key="rc_pid",placeholder="HC-2026-00123")
+        if st.button("🔍 Buscar historial del paciente",key="rc_pid_search"):
+            if not p_id.strip():
+                st.error("Ingrese el ID del paciente."); return
+            pr_df=query_df(
+                "SELECT instrument_code,batch_code,procedure_type,operating_room,"
+                "delivery_date,registered_by,created_at "
+                "FROM patient_deliveries WHERE patient_id=? ORDER BY created_at",
+                (p_id.strip(),))
+            st.markdown("---")
+            if pr_df.empty:
+                st.info("No se encontraron registros de entrega para este paciente.")
+            else:
+                st.warning(f"El paciente **{p_id.strip()}** tiene {len(pr_df)} registro(s) de entrega de instrumental.")
+                st.dataframe(pr_df.rename(columns={
+                    "instrument_code":"Código","batch_code":"Lote",
+                    "procedure_type":"Procedimiento","operating_room":"Quirófano/Sala",
+                    "delivery_date":"Fecha entrega","registered_by":"Registrado por",
+                    "created_at":"Creado en"}), use_container_width=True)
+                audit(st.session_state["user"],"Consulta paciente","Recall",
+                      f"Paciente: {p_id.strip()} — {len(pr_df)} lote(s)")
 
 # ─── Alertas ──────────────────────────────────────────────────────────────────
 def alerts_module():
@@ -2996,7 +3172,7 @@ def main():
     header()
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
-        "🔍 Consulta de trazabilidad","🔔 Alertas y novedades","📌 Plan de mejora",
+        "🔍 Consulta de trazabilidad","� Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
         "📊 Reportes e indicadores","📝 Encuesta de percepción","🔒 Auditoría de cambios",
         "⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
     ]
@@ -3006,6 +3182,7 @@ def main():
         "🔧 Registro de instrumental":instruments_module,
         "📋 Registro del proceso":process_module,
         "🔍 Consulta de trazabilidad":traceability_module,
+        "🚨 Retiro de lote (Recall)":recall_module,
         "🔔 Alertas y novedades":alerts_module,
         "📌 Plan de mejora":improvement_module,
         "📊 Reportes e indicadores":reports_module,
