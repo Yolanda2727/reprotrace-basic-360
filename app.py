@@ -1465,6 +1465,47 @@ def dashboard():
                 _msg=f"**{_row['Código']}** / Lote `{_row['Lote']}` — vence el **{_row['Vence']}**"
                 if _row["Días"]<0:   st.error(f"🔴 {_msg} (VENCIDO hace {abs(int(_row['Días']))} día(s))")
                 else:                st.warning(f"🟡 {_msg} ({int(_row['Días'])} día(s) restantes)")
+    # ── Panel de lotes críticos ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🚨 Panel de lotes críticos")
+    st.caption("Lotes con alertas Alta abiertas o trazabilidad incompleta. Requieren acción antes de continuar el proceso.")
+    if not rec.empty:
+        # Construir tabla de estado por lote
+        _lotes = rec.groupby(["instrument_code","batch_code"])["stage"].apply(list).reset_index()
+        _lotes["etapas_completas"] = _lotes["stage"].apply(lambda s: len(set(s) & set(STAGES)))
+        _lotes["etapas_faltantes"] = _lotes["stage"].apply(
+            lambda s: [e for e in STAGES if e not in s])
+        _lotes["trazabilidad"] = _lotes["etapas_faltantes"].apply(
+            lambda f: "✅ Completa" if not f else f"⚠️ Faltan {len(f)}")
+        # Alertas Alta abiertas por lote
+        _al_alta = query_df(
+            "SELECT instrument_code,batch_code,COUNT(*) as n_alertas "
+            "FROM alerts WHERE status='Abierta' AND severity='Alta' "
+            "GROUP BY instrument_code,batch_code")
+        _lotes = _lotes.merge(_al_alta, on=["instrument_code","batch_code"], how="left")
+        _lotes["n_alertas"] = _lotes["n_alertas"].fillna(0).astype(int)
+        # Solo lotes con algún problema
+        _criticos = _lotes[(_lotes["n_alertas"]>0) | (_lotes["etapas_faltantes"].apply(len)>0)].copy()
+        if _criticos.empty:
+            st.success("🟢 Sin lotes críticos. Todos los lotes tienen trazabilidad completa y sin alertas Alta abiertas.")
+        else:
+            # Filtros interactivos
+            _fc1,_fc2 = st.columns(2)
+            _fcode = _fc1.text_input("🔍 Filtrar por código",key="crit_code")
+            _fbatch = _fc2.text_input("🔍 Filtrar por lote",key="crit_batch")
+            if _fcode:
+                _criticos = _criticos[_criticos["instrument_code"].str.contains(_fcode,case=False,na=False)]
+            if _fbatch:
+                _criticos = _criticos[_criticos["batch_code"].str.contains(_fbatch,case=False,na=False)]
+            # Tabla enriquecida
+            _tabla = _criticos[["instrument_code","batch_code","etapas_completas","trazabilidad","n_alertas"]].copy()
+            _tabla["faltantes"] = _criticos["etapas_faltantes"].apply(lambda f: ", ".join(f) if f else "—")
+            _tabla.columns = ["Código","Lote","Etapas completas","Trazabilidad","Alertas Alta 🔴","Etapas faltantes"]
+            _tabla = _tabla.sort_values("Alertas Alta 🔴", ascending=False).reset_index(drop=True)
+            st.dataframe(_tabla, use_container_width=True)
+            st.caption(f"🔴 {len(_criticos)} lote(s) requieren atención. Navegue a Alertas o Trazabilidad para gestionar cada caso.")
+    else:
+        st.info("Sin registros de proceso aún.")
 
 # ─── Registro de instrumental ─────────────────────────────────────────────────
 def instruments_module():
