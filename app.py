@@ -766,6 +766,15 @@ STAGE_REQUIRED = {
     "Distribución":                   "Almacenamiento",
 }
 
+import re as _re
+# Patrón de lote aceptado — flexible para contexto hospitalario colombiano:
+# Ejemplos válidos: LOTE-2026-001 | CRE-2026-045 | L-2026-001 | C-001 | C001
+# Mínimo: 3 caracteres alfanuméricos (con guiones opcionales)
+# Máximo: 30 caracteres. No permite espacios ni caracteres especiales.
+# Referencia: práctica recomendada Circular 01/2016 Supersalud Colombia.
+BATCH_PATTERN = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-]{1,28}[A-Za-z0-9]$')
+BATCH_HINT    = "Formato: letras, números y guiones (-). Mín. 3 caracteres. Ej: LOTE-2026-001, C-001, CRE-2026-045"
+
 USERS = {
     "admin":   {"password": "admin123",   "role": "Administrador"},
     "central": {"password": "central123", "role": "Personal de central"},
@@ -1575,6 +1584,7 @@ def process_module():
         sel=st.selectbox("Instrumental *",opts)
         code=sel.split("–")[0].strip()
         batch=st.text_input("Lote / carga *",placeholder="LOTE-2026-001")
+        st.caption(f"ℹ️ {BATCH_HINT}")
         stage=st.selectbox("Etapa *",STAGES)
         resp=st.text_input("Responsable *",value=st.session_state.get("user",""))
         complies=st.radio("¿Cumple protocolo?",["Sí","No"],horizontal=True)
@@ -1662,6 +1672,9 @@ def process_module():
     if submit:
         if not batch.strip() or not resp.strip():
             st.error("Lote/carga y responsable son obligatorios."); return
+        if not BATCH_PATTERN.match(batch.strip()):
+            st.error(f"🔴 Formato de lote inválido: '{batch.strip()}'. {BATCH_HINT}")
+            return
         # Detección de etapa duplicada
         _dup=query_df(
             "SELECT id,created_at,responsible FROM process_records WHERE instrument_code=? AND batch_code=? AND stage=? ORDER BY created_at DESC LIMIT 1",
