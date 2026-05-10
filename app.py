@@ -1506,6 +1506,12 @@ def process_module():
             ce_e=a.selectbox("Indicador químico externo",["Conforme","No conforme","No aplica"])
             ce_i=b.selectbox("Indicador químico interno",["Conforme","No conforme","No aplica"])
         elif stage=="Esterilización":
+            _prev_ins=query_df(
+                "SELECT inspection_status FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Inspección funcional' ORDER BY created_at DESC LIMIT 1",
+                (code,batch.strip()))
+            if not _prev_ins.empty and _prev_ins.iloc[0]["inspection_status"]=="Requiere mantenimiento":
+                st.error("🔴 BLOQUEO: Inspección funcional marcó este instrumental como 'Requiere mantenimiento'. "
+                         "No puede esterilizarse hasta que se registre una nueva Inspección funcional con estado apto.")
             a,b=st.columns(2)
             st_e=a.text_input("Equipo esterilizador",placeholder="EST-01")
             cy_t=b.selectbox("Tipo de ciclo",["Vapor 134°C","Vapor 121°C","Baja temperatura","Peróxido de hidrógeno","Otro"])
@@ -1544,6 +1550,14 @@ def process_module():
         s_dt=datetime.combine(sd,st_); e_dt=datetime.combine(ed,et)
         if e_dt<s_dt: st.error("Hora final no puede ser anterior a la inicial."); return
         if stage=="Esterilización":
+            _ins_mant=query_df(
+                "SELECT inspection_status FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Inspección funcional' ORDER BY created_at DESC LIMIT 1",
+                (code,batch.strip()))
+            if not _ins_mant.empty and _ins_mant.iloc[0]["inspection_status"]=="Requiere mantenimiento":
+                st.error("🔴 BLOQUEO DE SEGURIDAD: El instrumental fue marcado como 'Requiere mantenimiento' en "
+                         "Inspección funcional. Realice el mantenimiento, actualice el estado en Registro de "
+                         "instrumental y registre una nueva Inspección funcional con resultado apto antes de esterilizar.")
+                return
             _emq=query_df(
                 "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta' AND alert_type LIKE '%conforme%'",
                 (code,batch.strip()))
