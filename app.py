@@ -1272,6 +1272,51 @@ def _send_email_alert(subject: str, body: str) -> bool:
         return False
 
 
+def _generate_qr_bytes(data: str, size: int = 10, border: int = 2) -> bytes:
+    """Genera un código QR como PNG en memoria (bytes).
+
+    Usa la librería qrcode con PIL como backend de imagen.
+    Devuelve None si qrcode no está disponible (modo degradado sin crash).
+
+    Referencia: ISO 13485:2016 §7.5.9 — identificación y trazabilidad.
+    """
+    try:
+        import qrcode as _qr
+        from PIL import Image as _Img
+        qr = _qr.QRCode(
+            version=None,
+            error_correction=_qr.constants.ERROR_CORRECT_M,
+            box_size=size,
+            border=border,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _qr_payload(code: str, batch: str, stages_done: list, inst_name: str = "") -> str:
+    """Construye el texto JSON que se codifica en el QR de trazabilidad.
+
+    Campos: aplicación, versión, código, lote, nombre del instrumento,
+    etapas completadas, fecha de generación.
+    """
+    import json as _json
+    return _json.dumps({
+        "app":     "ReproTrace Basic 360",
+        "v":       "1.0",
+        "code":    code,
+        "batch":   batch,
+        "name":    inst_name,
+        "stages":  stages_done,
+        "date":    date.today().isoformat(),
+    }, ensure_ascii=False)
+
+
 def add_alert(code, batch, atype, sev, desc):
     execute("""INSERT INTO alerts(instrument_code,batch_code,alert_type,severity,description,status,created_at)
                VALUES(?,?,?,?,?,'Abierta',?)""",
@@ -2647,6 +2692,45 @@ def traceability_module():
                      "en el módulo '🚨 Retiro de lote (Recall)'.")
     else:
         st.info("Sin vinculación de pacientes registrada para este lote.")
+
+    # ─ Código QR de trazabilidad (Mejora U) ──────────────────────────────────
+    st.markdown("---")
+    st.subheader("📱 Código QR de trazabilidad")
+    st.caption(
+        "Escanea el QR para verificar la trazabilidad del lote. "
+        "Referencia: ISO 13485:2016 §7.5.9 — identificación y trazabilidad del producto."
+    )
+    _ins_name_row = query_df("SELECT name FROM instruments WHERE code=?", (code,))
+    _ins_name = _ins_name_row.iloc[0]["name"] if not _ins_name_row.empty else ""
+    _stages_done = df["stage"].tolist()
+    _qr_data = _qr_payload(code, batch, _stages_done, _ins_name)
+    _qr_png = _generate_qr_bytes(_qr_data)
+    if _qr_png:
+        qc1, qc2 = st.columns([1, 2])
+        with qc1:
+            st.image(_qr_png, caption=f"{code} / {batch}", width=220)
+        with qc2:
+            st.markdown("**Datos codificados en el QR:**")
+            st.json({
+                "Código instrumental": code,
+                "Nombre": _ins_name,
+                "Lote / carga": batch,
+                "Etapas completadas": _stages_done,
+                "Etapas faltantes": [s for s in STAGES if s not in _stages_done],
+                "Generado": date.today().isoformat(),
+            })
+            st.download_button(
+                "📥 Descargar QR (PNG)",
+                data=_qr_png,
+                file_name=f"QR_{code}_{batch}_{date.today()}.png",
+                mime="image/png",
+            )
+            st.info(
+                "💡 Imprima este QR y péguelo en el paquete esterilizado. "
+                "Al escanearlo se obtiene la trazabilidad completa del lote."
+            )
+    else:
+        st.warning("⚠️ Librería 'qrcode' no disponible. Instale con: pip install 'qrcode[pil]'")
 
 # ─── Retiro de lote / Recall ──────────────────────────────────────────────────
 def recall_module():
