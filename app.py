@@ -845,6 +845,8 @@ AUTO_REC = {
     "Parámetro real insuficiente (exposición)":   "RECHAZAR LA CARGA. Tiempo de exposición real registrado en impresión insuficiente. Reprocesar con parámetros correctos y verificar calibración.",
     "Límite de ciclos superado":                  "RETIRAR DEL CIRCUITO. El instrumental superó el límite de ciclos de reprocesamiento indicado por el fabricante (ISO 17664:2017). Dar de baja, documentar disposición final y reemplazar.",
     "Ciclos próximos al límite":                  "Planificar reemplazo del instrumental. Está próximo al límite de ciclos del fabricante (ISO 17664:2017). No descartarlo aún, pero gestionar adquisición de reemplazo.",
+    "Equipo sin calibración vigente":             "BLOQUEAR uso del equipo. No esterilizar hasta obtener certificado de calibración vigente. Contactar entidad metrológica acreditada (ISO 17665-1 / ISO 15883-1 / Res. 4816/2008).",
+    "Calibración de equipo próxima a vencer":     "Programar calibración antes del vencimiento. El equipo puede seguir operando, pero debe gestionarse la renovación del certificado (ISO 17665-1 §10 / AAMI ST79:2017 §12.4).",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -983,6 +985,22 @@ def init_db():
         created_at TEXT)""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_re_code_batch ON recall_events(instrument_code, batch_code)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_re_status     ON recall_events(status)")
+    # equipment_calibration: calibración y validación de equipos (ISO 17665 / ISO 15883)
+    cur.execute("""CREATE TABLE IF NOT EXISTS equipment_calibration (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        equipment_id   TEXT NOT NULL,
+        equipment_name TEXT NOT NULL,
+        equipment_type TEXT,
+        last_calibration_date TEXT,
+        next_calibration_date TEXT NOT NULL,
+        calibration_entity TEXT,
+        certificate_number TEXT,
+        result TEXT DEFAULT 'Conforme',
+        observations TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_equip_id       ON equipment_calibration(equipment_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ec_next_cal_date  ON equipment_calibration(next_calibration_date)")
     c.commit(); c.close()
 
 def _migrate_db():
@@ -1012,6 +1030,19 @@ def _migrate_db():
         closed_by TEXT,
         closed_at TEXT,
         closure_notes TEXT,
+        registered_by TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS equipment_calibration (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        equipment_id   TEXT NOT NULL,
+        equipment_name TEXT NOT NULL,
+        equipment_type TEXT,
+        last_calibration_date TEXT,
+        next_calibration_date TEXT NOT NULL,
+        calibration_entity TEXT,
+        certificate_number TEXT,
+        result TEXT DEFAULT 'Conforme',
+        observations TEXT,
         registered_by TEXT,
         created_at TEXT)""")
     c.commit()
@@ -1048,6 +1079,8 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_pd_patient_id  ON patient_deliveries(patient_id)",
         "CREATE INDEX IF NOT EXISTS idx_re_code_batch ON recall_events(instrument_code, batch_code)",
         "CREATE INDEX IF NOT EXISTS idx_re_status     ON recall_events(status)",
+        "CREATE INDEX IF NOT EXISTS idx_ec_equip_id       ON equipment_calibration(equipment_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ec_next_cal_date  ON equipment_calibration(next_calibration_date)",
     ]
     for stmt in idx_stmts:
         try:
@@ -1145,6 +1178,61 @@ def check_and_recommend():
         execute("""INSERT INTO improvement_plans(finding,risk_type,risk_level,corrective_action,state,registered_by,created_at)
                    VALUES(?,?,?,?,'Pendiente','sistema',?)""",
                 (finding, row["alert_type"], "Alta", rec, datetime.now().isoformat()))
+
+
+def _check_equipment_calibration(equipment_id: str) -> None:
+    """Genera alertas cuando un equipo esterilizador tiene calibración vencida o próxima a vencer.
+
+    Consulta el registro más reciente de equipment_calibration para el equipo indicado.
+    - Vencida  (today >= next_calibration_date): alerta Alta  'Equipo sin calibración vigente'
+    - Próxima  (0 < días restantes ≤ 30):        alerta Media 'Calibración de equipo próxima a vencer'
+    Idempotente: no genera alerta si ya existe una abierta del mismo tipo para el equipo.
+
+    Referencia: ISO 17665-1:2006 §10 / ISO 15883-1:2009 §6.3 /
+                AAMI ST79:2017 §12.4 / Resolución 4816/2008 MinSalud Colombia.
+    """
+    row = query_df(
+        "SELECT next_calibration_date,equipment_name FROM equipment_calibration "
+        "WHERE equipment_id=? ORDER BY next_calibration_date DESC LIMIT 1",
+        (equipment_id,))
+    if row.empty:
+        return
+    eq_name = row.iloc[0]["equipment_name"]
+    try:
+        next_cal = date.fromisoformat(str(row.iloc[0]["next_calibration_date"]))
+    except (ValueError, TypeError):
+        return
+    today = date.today()
+    days_left = (next_cal - today).days
+
+    def _has_open(atype):
+        ex = query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type=? AND status='Abierta'",
+            (equipment_id,))
+        return not ex.empty and (ex["alert_type"] == atype).any() if "alert_type" in ex.columns else not ex.empty
+
+    # Reutilizamos instrument_code para identificar equipo en la tabla de alertas
+    if days_left < 0:
+        ex = query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type='Equipo sin calibración vigente' AND status='Abierta'",
+            (equipment_id,))
+        if ex.empty:
+            add_alert(equipment_id, "—", "Equipo sin calibración vigente", "Alta",
+                      f"Equipo '{eq_name}' ({equipment_id}): calibración vencida desde "
+                      f"{next_cal.isoformat()} ({abs(days_left)} días de atraso). "
+                      f"No utilizar para esterilización hasta renovar el certificado. "
+                      f"(ISO 17665-1 / AAMI ST79:2017 §12.4)")
+    elif days_left <= 30:
+        ex = query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type='Calibración de equipo próxima a vencer' AND status='Abierta'",
+            (equipment_id,))
+        if ex.empty:
+            add_alert(equipment_id, "—", "Calibración de equipo próxima a vencer", "Media",
+                      f"Equipo '{eq_name}' ({equipment_id}): calibración vence en "
+                      f"{days_left} día(s) ({next_cal.isoformat()}). "
+                      f"Programar renovación de certificado. "
+                      f"(ISO 17665-1 §10 / AAMI ST79:2017 §12.4)")
+
 
 def _get_operator_stats(rec: "pd.DataFrame") -> "pd.DataFrame":
     """Métricas de calidad por operador (campo 'responsible' de process_records).
@@ -2094,6 +2182,25 @@ def process_module():
                              f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). "
                              "Corríjalo antes de guardar.")
                     return
+            # Bloqueo de calibración vigente (Mejora Q) ───────────────────────
+            if st_e and st_e.strip():
+                _cal = query_df(
+                    "SELECT next_calibration_date FROM equipment_calibration "
+                    "WHERE equipment_id=? ORDER BY next_calibration_date DESC LIMIT 1",
+                    (st_e.strip(),))
+                if not _cal.empty:
+                    try:
+                        _ncd = date.fromisoformat(str(_cal.iloc[0]["next_calibration_date"]))
+                        if date.today() >= _ncd:
+                            _check_equipment_calibration(st_e.strip())
+                            st.error(
+                                f"🔴 BLOQUEO DE SEGURIDAD: El equipo '{st_e.strip()}' tiene calibración "
+                                f"vencida desde {_ncd.isoformat()}. No puede usarse para esterilización "
+                                f"hasta que se registre un certificado de calibración vigente. "
+                                f"(ISO 17665-1 / AAMI ST79:2017 §12.4 / Res. 4816/2008)")
+                            return
+                    except (ValueError, TypeError):
+                        pass
             # Validación de parámetros REALES (impresión ciclo) ───────────────
             if act_temp is not None and cy_t not in ("Otro",""):
                 _min_t=STERIL_MIN_TEMP.get(cy_t)
@@ -2207,6 +2314,8 @@ def process_module():
         _check_expiring_packages()
         if stage=="Esterilización":
             _check_instrument_lifecycle(code)
+            if st_e and st_e.strip():
+                _check_equipment_calibration(st_e.strip())
         if stage=="Distribución" and pat_id.strip():
             execute("""
                 INSERT INTO patient_deliveries
@@ -3651,6 +3760,121 @@ def tests_module():
     ],columns=["Prueba","Procedimiento","Criterio de aprobación"])
     st.dataframe(df,use_container_width=True)
 
+# ─── Calibración de equipos (Mejora Q) ────────────────────────────────────────
+def calibration_module():
+    st.header("🔩 Calibración y validación de equipos")
+    st.caption(
+        "Referencia: ISO 17665-1:2006 §10 / ISO 15883-1:2009 §6.3 / "
+        "AAMI ST79:2017 §12.4 / Resolución 4816/2008 MinSalud Colombia"
+    )
+    user = st.session_state["user"]
+    tab_reg, tab_lista = st.tabs(["➕ Registrar calibración", "📋 Historial de equipos"])
+
+    # ── Tab 1: Registro ───────────────────────────────────────────────────────
+    with tab_reg:
+        st.subheader("Registrar certificado de calibración")
+        with st.form("cal_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            eq_id   = c1.text_input("ID del equipo *", placeholder="EST-01",
+                                    help="Debe coincidir con el 'Equipo esterilizador' en el Registro del proceso.")
+            eq_name = c2.text_input("Nombre del equipo *", placeholder="Autoclave de vapor 134°C")
+            c3, c4 = st.columns(2)
+            eq_type = c3.selectbox("Tipo de equipo",
+                                   ["Autoclave / esterilizador de vapor",
+                                    "Esterilizador de óxido de etileno",
+                                    "Esterilizador de peróxido de hidrógeno",
+                                    "Termodesinfectadora (ISO 15883)",
+                                    "Lavadora-descontaminadora",
+                                    "Otro"])
+            cal_result = c4.selectbox("Resultado de calibración", ["Conforme", "No conforme"])
+            c5, c6 = st.columns(2)
+            last_date = c5.date_input("Fecha de última calibración", value=date.today())
+            next_date = c6.date_input("Próxima calibración (vencimiento) *",
+                                      value=date.today() + timedelta(days=365),
+                                      min_value=date.today())
+            c7, c8 = st.columns(2)
+            entity = c7.text_input("Entidad calibradora", placeholder="Metrocal S.A.S.")
+            cert_no = c8.text_input("Nº certificado", placeholder="CAL-2026-0001")
+            obs = st.text_area("Observaciones")
+            submitted = st.form_submit_button("💾 Guardar calibración")
+        if submitted:
+            if not eq_id.strip() or not eq_name.strip():
+                st.error("El ID y el nombre del equipo son obligatorios.")
+            elif next_date <= last_date:
+                st.error("La fecha de próxima calibración debe ser posterior a la última calibración.")
+            else:
+                execute("""INSERT INTO equipment_calibration
+                    (equipment_id,equipment_name,equipment_type,last_calibration_date,
+                     next_calibration_date,calibration_entity,certificate_number,
+                     result,observations,registered_by,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (eq_id.strip(), eq_name.strip(), eq_type,
+                     last_date.isoformat(), next_date.isoformat(),
+                     entity.strip(), cert_no.strip(), cal_result, obs.strip(),
+                     user, datetime.now().isoformat()))
+                audit(user, "Calibración registrada", "Calibración",
+                      f"Equipo {eq_id.strip()} — {eq_name.strip()} — vence {next_date.isoformat()}")
+                st.success(f"✅ Calibración registrada para '{eq_name.strip()}'. Vence: {next_date.isoformat()}")
+                st.rerun()
+
+    # ── Tab 2: Historial y semáforo ───────────────────────────────────────────
+    with tab_lista:
+        st.subheader("Estado de calibración por equipo")
+        df_cal = query_df(
+            "SELECT equipment_id,equipment_name,equipment_type,last_calibration_date,"
+            "next_calibration_date,calibration_entity,certificate_number,result,observations,registered_by,created_at "
+            "FROM equipment_calibration ORDER BY next_calibration_date ASC")
+        if df_cal.empty:
+            st.info("No hay registros de calibración. Usa la pestaña '➕ Registrar calibración' para agregar el primer equipo.")
+        else:
+            today = date.today()
+            def _estado(nxt_raw):
+                try:
+                    nxt = date.fromisoformat(str(nxt_raw))
+                    days = (nxt - today).days
+                    if days < 0:       return f"🔴 Vencida ({abs(days)} días)"
+                    elif days <= 30:   return f"🟡 Vence en {days} días"
+                    else:              return f"🟢 Vigente ({days} días)"
+                except (ValueError, TypeError):
+                    return "❓ Fecha inválida"
+
+            df_show = df_cal.copy()
+            df_show["Estado calibración"] = df_cal["next_calibration_date"].apply(_estado)
+            # Disparar alertas para equipos vencidos o próximos durante visualización
+            for _, row in df_cal.iterrows():
+                _check_equipment_calibration(str(row["equipment_id"]))
+            st.dataframe(
+                df_show.rename(columns={
+                    "equipment_id":          "ID Equipo",
+                    "equipment_name":        "Nombre",
+                    "equipment_type":        "Tipo",
+                    "last_calibration_date": "Última calibración",
+                    "next_calibration_date": "Próxima calibración",
+                    "calibration_entity":    "Entidad calibradora",
+                    "certificate_number":    "N° cert.",
+                    "result":                "Resultado",
+                    "observations":          "Observaciones",
+                    "registered_by":         "Registrado por",
+                    "created_at":            "Fecha registro",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_order=["ID Equipo","Nombre","Tipo","Última calibración",
+                              "Próxima calibración","Estado calibración",
+                              "Entidad calibradora","N° cert.","Resultado","Observaciones"],
+            )
+            vencidos = df_show[df_show["Estado calibración"].str.startswith("🔴")]
+            proximos = df_show[df_show["Estado calibración"].str.startswith("🟡")]
+            if not vencidos.empty:
+                st.error(f"🔴 {len(vencidos)} equipo(s) con calibración VENCIDA: "
+                         + ", ".join(vencidos["equipment_id"].tolist()))
+            if not proximos.empty:
+                st.warning(f"🟡 {len(proximos)} equipo(s) próximos a vencer: "
+                           + ", ".join(proximos["equipment_id"].tolist()))
+            if vencidos.empty and proximos.empty:
+                st.success("🟢 Todos los equipos tienen calibración vigente con más de 30 días restantes.")
+
+
 # ─── Limitaciones ─────────────────────────────────────────────────────────────
 def limitations_module():
     st.header("11. Limitaciones del prototipo")
@@ -3686,9 +3910,9 @@ def main():
     header()
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
-        "🔍 Consulta de trazabilidad","� Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
-        "📊 Reportes e indicadores","📝 Encuesta de percepción","🔒 Auditoría de cambios",
-        "⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
+        "🔍 Consulta de trazabilidad","🚨 Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
+        "📊 Reportes e indicadores","🔩 Calibración de equipos","📝 Encuesta de percepción",
+        "🔒 Auditoría de cambios","⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
     ]
     menu=st.sidebar.radio("Menú",MENU)
     dispatch={
@@ -3700,7 +3924,8 @@ def main():
         "🔔 Alertas y novedades":alerts_module,
         "📌 Plan de mejora":improvement_module,
         "📊 Reportes e indicadores":reports_module,
-        "📝 Encuesta de percepción":survey_module,
+        "� Calibración de equipos":calibration_module,
+        "�📝 Encuesta de percepción":survey_module,
         "🔒 Auditoría de cambios":audit_module,
         "⚙️ Configuración y respaldo":config_module,
         "✅ Plan de pruebas":tests_module,
