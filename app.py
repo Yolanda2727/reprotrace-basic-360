@@ -1510,7 +1510,12 @@ def process_module():
         if bi_i=="No conforme": add_alert(code,batch.strip(),"Indicador biológico no conforme","Alta","Indicador biológico no conforme. Rechazar carga.")
         if ch_i=="No conforme": add_alert(code,batch.strip(),"Indicador no conforme","Alta","Indicador químico no conforme en validación.")
         if cl_c=="No conforme": add_alert(code,batch.strip(),"Limpieza no conforme","Alta",f"Limpieza no conforme. {cl_n}")
-        if stage=="Distribución" and rel and rel!="Aprobado": add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación aprobada.")
+        if stage=="Distribución":
+            _val=query_df(
+                "SELECT release_result FROM process_records WHERE instrument_code=? AND batch_code=? AND stage='Validación / liberación de carga'",
+                (code,batch.strip()))
+            if _val.empty or _val.iloc[0]["release_result"]!="Aprobado":
+                add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación de carga aprobada.")
         check_and_recommend()
         st.success(f"✅ Etapa '{stage}' registrada.")
     st.dataframe(query_df("SELECT * FROM process_records ORDER BY created_at DESC LIMIT 30"),use_container_width=True)
