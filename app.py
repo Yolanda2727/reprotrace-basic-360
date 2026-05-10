@@ -843,6 +843,8 @@ AUTO_REC = {
     "Parámetro real insuficiente (temperatura)":  "RECHAZAR LA CARGA. Temperatura real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 / AAMI ST79). Verificar calibración del equipo y reprocesar.",
     "Parámetro real insuficiente (presión)":      "RECHAZAR LA CARGA. Presión real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 §22.3). Verificar calibración del equipo y reprocesar.",
     "Parámetro real insuficiente (exposición)":   "RECHAZAR LA CARGA. Tiempo de exposición real registrado en impresión insuficiente. Reprocesar con parámetros correctos y verificar calibración.",
+    "Límite de ciclos superado":                  "RETIRAR DEL CIRCUITO. El instrumental superó el límite de ciclos de reprocesamiento indicado por el fabricante (ISO 17664:2017). Dar de baja, documentar disposición final y reemplazar.",
+    "Ciclos próximos al límite":                  "Planificar reemplazo del instrumental. Está próximo al límite de ciclos del fabricante (ISO 17664:2017). No descartarlo aún, pero gestionar adquisición de reemplazo.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -875,6 +877,7 @@ def init_db():
         code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT,
         spaulding TEXT, service_origin TEXT, quantity INTEGER DEFAULT 1,
         status TEXT DEFAULT 'Activo', observations TEXT,
+        manufacturer TEXT, model TEXT, max_cycles INTEGER,
         registered_by TEXT, created_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS process_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1019,6 +1022,9 @@ def _migrate_db():
         "ALTER TABLE process_records ADD COLUMN actual_temperature REAL",
         "ALTER TABLE process_records ADD COLUMN actual_pressure REAL",
         "ALTER TABLE process_records ADD COLUMN actual_exposure_time REAL",
+        "ALTER TABLE instruments ADD COLUMN manufacturer TEXT",
+        "ALTER TABLE instruments ADD COLUMN model TEXT",
+        "ALTER TABLE instruments ADD COLUMN max_cycles INTEGER",
     ]:
         try:
             c.execute(stmt); c.commit()
@@ -1178,6 +1184,44 @@ def _check_expiring_packages():
             add_alert(code,batch,"Paquete vencido","Alta",f"Paquete vencido desde {exp.isoformat()}. No distribuir. Reprocesar.")
         elif 0<=days<=7 and not _has("Vencimiento próximo"):
             add_alert(code,batch,"Vencimiento próximo","Media",f"Paquete vence en {days} día(s) ({exp.isoformat()}). Planificar uso o reprocesamiento.")
+
+def _check_instrument_lifecycle(code: str) -> None:
+    """Genera alerta cuando un instrumento alcanza o supera el límite de ciclos del fabricante.
+
+    Referencia: ISO 17664:2017 — instrucciones del fabricante para reprocesamiento.
+    Solo actúa si max_cycles fue definido en el registro del instrumental.
+    """
+    ins=query_df("SELECT name,max_cycles FROM instruments WHERE code=?",(code,))
+    if ins.empty: return
+    row=ins.iloc[0]
+    max_c=row.get("max_cycles")
+    if not max_c or max_c<=0: return          # sin límite definido
+    max_c=int(max_c)
+    # Contar ciclos completados de esterilización (≈ 1 ciclo de reprocesamiento)
+    done=query_df(
+        "SELECT COUNT(*) as n FROM process_records WHERE instrument_code=? AND stage='Esterilización'",
+        (code,)).iloc[0]["n"]
+    done=int(done)
+    name=row.get("name","")
+    pct=done/max_c
+    # Alerta Alta: límite superado
+    if pct>=1.0:
+        ex_al=query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type='Límite de ciclos superado' AND status='Abierta'",
+            (code,))
+        if ex_al.empty:
+            add_alert(code,"—","Límite de ciclos superado","Alta",
+                      f"'{name}' ({code}) alcanzó {done}/{max_c} ciclos de reprocesamiento. "
+                      f"Supera el límite del fabricante (ISO 17664:2017). Retirar del circuito y evaluar baja.")
+    # Alerta Media: ≥80 % del límite
+    elif pct>=0.8:
+        ex_al=query_df(
+            "SELECT id FROM alerts WHERE instrument_code=? AND alert_type='Ciclos próximos al límite' AND status='Abierta'",
+            (code,))
+        if ex_al.empty:
+            add_alert(code,"—","Ciclos próximos al límite","Media",
+                      f"'{name}' ({code}) llevan {done}/{max_c} ciclos "
+                      f"({pct*100:.0f}% del límite del fabricante — ISO 17664:2017). Planificar reemplazo.")
 
 def _trigger_recall(code: str, batch: str, trigger_type: str, description: str, user: str) -> bool:
     """Crea un evento formal de retiro de lote si el lote fue distribuido a pacientes.
@@ -1739,14 +1783,23 @@ def instruments_module():
             qty =c2.number_input("Cantidad",min_value=1,value=1)
             sta =c1.selectbox("Estado",["Activo","Dañado","Retirado","En mantenimiento"])
             obs =st.text_area("Observaciones")
+            st.markdown("**🔄 Ciclo de vida (ISO 17664:2017)**")
+            st.caption("Ingrese la información del fabricante para controlar el límite de reprocesos.")
+            lc1,lc2,lc3=st.columns(3)
+            mfr=lc1.text_input("Fabricante",placeholder="Aesculap, KLS Martin…")
+            mdl=lc2.text_input("Modelo / referencia",placeholder="BB417R")
+            max_c=lc3.number_input("Máx. ciclos de reprocesamiento",min_value=0,value=0,
+                                    help="0 = no definido / ilimitado. Consulte las instrucciones del fabricante (ISO 17664:2017).")
             if st.form_submit_button("💾 Guardar"):
                 if not code.strip() or not name.strip():
                     st.error("Código y nombre son obligatorios.")
                 else:
                     try:
-                        execute("""INSERT INTO instruments(code,name,category,spaulding,service_origin,quantity,status,observations,registered_by,created_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                                (code.strip(),name.strip(),cat,spa,srv,qty,sta,obs,st.session_state["user"],datetime.now().isoformat()))
+                        execute("""INSERT INTO instruments(code,name,category,spaulding,service_origin,quantity,status,observations,manufacturer,model,max_cycles,registered_by,created_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (code.strip(),name.strip(),cat,spa,srv,qty,sta,obs,
+                                 mfr.strip(),mdl.strip(),max_c if max_c>0 else None,
+                                 st.session_state["user"],datetime.now().isoformat()))
                         audit(st.session_state["user"],"Registro","Instrumental",f"Código:{code}")
                         st.success(f"Instrumental {code} guardado."); st.rerun()
                     except sqlite3.IntegrityError:
@@ -1757,7 +1810,35 @@ def instruments_module():
     fs=fc2.selectbox("Estado",["Todos","Activo","Dañado","Retirado","En mantenimiento"])
     if q: df=df[df["code"].str.contains(q,case=False,na=False)|df["name"].str.contains(q,case=False,na=False)]
     if fs!="Todos": df=df[df["status"]==fs]
-    st.dataframe(df,use_container_width=True)
+    # ─ Tabla de ciclos de vida ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔄 Ciclos de reprocesamiento por instrumento")
+    st.caption("Fuente: registros de Esterilización completados. Referencia: ISO 17664:2017.")
+    rec_all=query_df("SELECT instrument_code FROM process_records WHERE stage='Esterilización'")
+    if not rec_all.empty and not df.empty:
+        cycles_df=rec_all.groupby("instrument_code").size().reset_index(name="ciclos_realizados")
+        merged=df[["code","name","max_cycles","status"]].merge(
+            cycles_df, left_on="code", right_on="instrument_code", how="left")
+        merged["ciclos_realizados"]=merged["ciclos_realizados"].fillna(0).astype(int)
+        merged["max_cycles"]=merged["max_cycles"].where(merged["max_cycles"].notna(), None)
+        def _pct(row):
+            if row["max_cycles"] and row["max_cycles"]>0:
+                return f"{row['ciclos_realizados']}/{int(row['max_cycles'])} ({row['ciclos_realizados']/row['max_cycles']*100:.0f}%)"
+            return f"{row['ciclos_realizados']} / sin límite"
+        def _estado(row):
+            if row["max_cycles"] and row["max_cycles"]>0:
+                p=row["ciclos_realizados"]/row["max_cycles"]
+                if p>=1.0: return "🔴 Límite superado"
+                if p>=0.8: return "🟡 Próximo al límite"
+            return "🟢 OK"
+        merged["uso"]=merged.apply(_pct,axis=1)
+        merged["alerta_ciclos"]=merged.apply(_estado,axis=1)
+        tabla=merged[["code","name","status","ciclos_realizados","uso","alerta_ciclos"]].rename(columns={
+            "code":"Código","name":"Nombre","status":"Estado",
+            "ciclos_realizados":"Ciclos realizados","uso":"Uso vs límite","alerta_ciclos":"Estado ciclo"})
+        st.dataframe(tabla,use_container_width=True)
+    else:
+        st.dataframe(df,use_container_width=True)
 
 # ─── Registro del proceso ─────────────────────────────────────────────────────
 def process_module():
@@ -2066,7 +2147,8 @@ def process_module():
                 add_alert(code,batch.strip(),"Validación pendiente","Alta","Distribución sin liberación de carga aprobada.")
         check_and_recommend()
         _check_expiring_packages()
-        # ─ Vinculación instrumental → paciente (ISO 13485:2016 §8.3) ──────────────
+        if stage=="Esterilización":
+            _check_instrument_lifecycle(code)
         if stage=="Distribución" and pat_id.strip():
             execute("""
                 INSERT INTO patient_deliveries
