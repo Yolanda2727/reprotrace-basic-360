@@ -1146,6 +1146,64 @@ def check_and_recommend():
                    VALUES(?,?,?,?,'Pendiente','sistema',?)""",
                 (finding, row["alert_type"], "Alta", rec, datetime.now().isoformat()))
 
+def _get_operator_stats(rec: "pd.DataFrame") -> "pd.DataFrame":
+    """Métricas de calidad por operador (campo 'responsible' de process_records).
+
+    Columnas calculadas:
+      Registros       — total de registros del operador
+      Cumplimientos   — registros con complies == 'Sí'
+      % Cumplimiento  — porcentaje de cumplimiento
+      Rechazados      — registros con result == 'Rechazado'
+      Etapa más freq. — etapa con mayor frecuencia de registros
+      T. prom. (min)  — tiempo promedio de etapas (duration_minutes)
+
+    Referencia: ISO 13485:2016 §6.2 — competencia del personal /
+                OPS-OMS Guía CEyE 2016.
+    """
+    if rec.empty:
+        return pd.DataFrame()
+    rows = []
+    for op, g in rec.groupby("responsible", sort=False):
+        total = len(g)
+        cumple = int((g["complies"] == "Sí").sum())
+        rechazados = int((g["result"] == "Rechazado").sum())
+        pct = round(cumple / total * 100, 1) if total else 0.0
+        etapa_frec = g["stage"].value_counts().idxmax() if total else "—"
+        dur = g["duration_minutes"].dropna()
+        t_prom = round(float(dur.mean()), 1) if not dur.empty else 0.0
+        rows.append({
+            "Operador": op,
+            "Registros": total,
+            "Cumplimientos": cumple,
+            "% Cumplimiento": pct,
+            "Rechazados": rechazados,
+            "Etapa más freq.": etapa_frec,
+            "T. prom. (min)": t_prom,
+        })
+    return (pd.DataFrame(rows)
+            .sort_values("% Cumplimiento", ascending=True)
+            .reset_index(drop=True))
+
+
+def _chart_operator_stats(df_op: "pd.DataFrame"):
+    """Gráfica de barras horizontales: % cumplimiento por operador."""
+    plt = _get_plt()
+    fig, ax = plt.subplots(figsize=(7, max(2, len(df_op) * 0.55)))
+    colors = ["#d62728" if v < 90 else "#ff7f0e" if v < 95 else "#2ca02c"
+              for v in df_op["% Cumplimiento"]]
+    ax.barh(df_op["Operador"], df_op["% Cumplimiento"], color=colors, height=0.6)
+    ax.axvline(95, color="#555555", linestyle="--", linewidth=1, label="Meta 95 %")
+    ax.set_xlabel("% Cumplimiento")
+    ax.set_xlim(0, 105)
+    for i, (v, r) in enumerate(zip(df_op["% Cumplimiento"], df_op["Rechazados"])):
+        label = f"{v}%  ({r} rec.)" if r > 0 else f"{v}%"
+        ax.text(v + 1, i, label, va="center", fontsize=8)
+    ax.legend(fontsize=8)
+    ax.set_title("Cumplimiento por operador (meta ≥ 95 %)\nReferencia: ISO 13485:2016 §6.2", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
 def _calc_failure_rate(rec):
     """
     Tasa de reprocesamiento fallido:
@@ -3345,6 +3403,50 @@ def reports_module():
                     use_container_width=True)
     elif _tasa==0.0:
         st.success("🟢 Sin lotes fallidos en Esterilización/Validación. Índice de calidad óptimo.")
+    # ─── Métricas por personal (Mejora P) ────────────────────────────────────
+    st.markdown("---")
+    st.subheader("👤 Métricas de desempeño por operador")
+    st.caption("Referencia: ISO 13485:2016 §6.2 — Competencia del personal / OPS-OMS Guía CEyE 2016. Meta de cumplimiento: ≥ 95 %")
+    df_op = _get_operator_stats(rec)
+    if df_op.empty:
+        st.info("Sin registros de proceso disponibles para calcular métricas por operador.")
+    else:
+        # ── Semáforo de operadores críticos ──────────────────────────────────
+        criticos = df_op[df_op["% Cumplimiento"] < 90]
+        advertencia = df_op[(df_op["% Cumplimiento"] >= 90) & (df_op["% Cumplimiento"] < 95)]
+        if not criticos.empty:
+            ops_cr = ", ".join(criticos["Operador"].tolist())
+            st.error(f"🔴 Operadores con cumplimiento crítico (< 90 %): **{ops_cr}**")
+        if not advertencia.empty:
+            ops_adv = ", ".join(advertencia["Operador"].tolist())
+            st.warning(f"🟡 Operadores por debajo de la meta (90–94 %): **{ops_adv}**")
+        if criticos.empty and advertencia.empty:
+            st.success("🟢 Todos los operadores cumplen la meta de ≥ 95 %.")
+        # ── Tabla de métricas ────────────────────────────────────────────────
+        st.dataframe(
+            df_op.rename(columns={
+                "Operador": "Operador / Responsable",
+                "T. prom. (min)": "Tiempo prom. (min)",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        # ── Gráfica ──────────────────────────────────────────────────────────
+        st.subheader("Gráfica de cumplimiento por operador")
+        fig_op = _chart_operator_stats(df_op)
+        st.pyplot(fig_op)
+        # ── Exportar ─────────────────────────────────────────────────────────
+        import io as _io
+        _buf_op = _io.BytesIO()
+        with pd.ExcelWriter(_buf_op, engine="openpyxl") as _wr:
+            df_op.to_excel(_wr, index=False, sheet_name="Métricas por operador")
+        st.download_button(
+            "📥 Exportar métricas por operador (Excel)",
+            data=_buf_op.getvalue(),
+            file_name=f"metricas_operadores_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        _get_plt().close(fig_op)
     st.markdown("---")
     st.subheader("Filtros")
     fc1,fc2,fc3=st.columns(3)
