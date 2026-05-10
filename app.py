@@ -1959,6 +1959,66 @@ def dashboard():
             use_container_width=True)
 
 # ─── Registro de instrumental ─────────────────────────────────────────────────
+_BULK_COLS_REQUIRED = ["code", "name"]
+_BULK_COLS_OPTIONAL = ["category", "spaulding", "service_origin", "quantity",
+                       "status", "observations", "manufacturer", "model", "max_cycles"]
+_BULK_SPAULDING_VALID = {"Crítico", "Semicrítico", "No crítico"}
+_BULK_STATUS_VALID    = {"Activo", "Dañado", "Retirado", "En mantenimiento"}
+
+def _bulk_import_instruments(df_raw: "pd.DataFrame", user: str) -> tuple:
+    """Importa instrumental masivamente desde un DataFrame normalizado.
+
+    Valida cada fila y devuelve (inserted, skipped, errors) donde:
+      inserted — int: filas insertadas con éxito
+      skipped  — list[str]: códigos omitidos porque ya existen
+      errors   — list[str]: filas con errores de validación
+    Referencia: ISO 13485:2016 §7.5 / Res. 4816/2008 MinSalud Colombia.
+    """
+    inserted, skipped, errors = 0, [], []
+    # Normalizar columnas a minúsculas sin espacios
+    df_raw.columns = [c.strip().lower().replace(" ", "_") for c in df_raw.columns]
+    # Verificar columnas obligatorias
+    for req in _BULK_COLS_REQUIRED:
+        if req not in df_raw.columns:
+            return 0, [], [f"Columna obligatoria faltante: '{req}'"]
+    for i, row in df_raw.iterrows():
+        rn = i + 2  # número de fila (1-based + encabezado)
+        code = str(row.get("code", "")).strip()
+        name = str(row.get("name", "")).strip()
+        if not code or not name:
+            errors.append(f"Fila {rn}: 'code' y 'name' son obligatorios.")
+            continue
+        # Validar Spaulding
+        spa = str(row.get("spaulding", "Crítico")).strip()
+        if spa not in _BULK_SPAULDING_VALID:
+            spa = "Crítico"
+        # Validar status
+        sta = str(row.get("status", "Activo")).strip()
+        if sta not in _BULK_STATUS_VALID:
+            sta = "Activo"
+        # Cantidad y max_cycles: enteros seguros
+        try: qty = max(1, int(row.get("quantity", 1)))
+        except (ValueError, TypeError): qty = 1
+        try: max_c_val = int(row.get("max_cycles", 0)) or None
+        except (ValueError, TypeError): max_c_val = None
+        cat  = str(row.get("category", "")).strip()
+        srv  = str(row.get("service_origin", "")).strip()
+        obs  = str(row.get("observations", "")).strip()
+        mfr  = str(row.get("manufacturer", "")).strip()
+        mdl  = str(row.get("model", "")).strip()
+        try:
+            execute("""INSERT INTO instruments
+                (code,name,category,spaulding,service_origin,quantity,status,
+                 observations,manufacturer,model,max_cycles,registered_by,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (code, name, cat, spa, srv, qty, sta, obs, mfr, mdl, max_c_val,
+                 user, datetime.now().isoformat()))
+            inserted += 1
+        except sqlite3.IntegrityError:
+            skipped.append(code)
+    return inserted, skipped, errors
+
+
 def instruments_module():
     st.header("1. Registro maestro de instrumental")
     st.info("💡 Registre cada instrumento con su código único. La clasificación de Spaulding determina el nivel de reprocesamiento requerido.")
@@ -1994,6 +2054,71 @@ def instruments_module():
                         st.success(f"Instrumental {code} guardado."); st.rerun()
                     except sqlite3.IntegrityError:
                         st.error("Ya existe ese código.")
+    # ─── Importación masiva (Mejora S) ───────────────────────────────────────
+    with st.expander("📥 Importación masiva de instrumental (CSV / Excel)", expanded=False):
+        st.caption(
+            "Sube un archivo CSV o Excel con los datos de múltiples instrumentos. "
+            "Referencia: ISO 13485:2016 §7.5 / Res. 4816/2008 MinSalud Colombia."
+        )
+        # Plantilla descargable
+        _tmpl = pd.DataFrame(columns=["code","name","category","spaulding",
+                                       "service_origin","quantity","status",
+                                       "observations","manufacturer","model","max_cycles"])
+        _tmpl_ex = [
+            ["IQ-010","Pinza Kelly","Prensión","Crítico","Cirugía general",2,"Activo","","Aesculap","BD408R",200],
+            ["IQ-011","Tijera Mayo","Corte","Crítico","Ginecología",1,"Activo","","KLS Martin","21-260-15",150],
+        ]
+        _tmpl = pd.DataFrame(_tmpl_ex, columns=_tmpl.columns)
+        _tmpl_buf = io.BytesIO()
+        with pd.ExcelWriter(_tmpl_buf, engine="openpyxl") as _tw:
+            _tmpl.to_excel(_tw, index=False, sheet_name="Instrumental")
+        st.download_button(
+            "📄 Descargar plantilla Excel",
+            data=_tmpl_buf.getvalue(),
+            file_name="plantilla_importacion_instrumental.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Descarga la plantilla con las columnas requeridas y ejemplos.",
+        )
+        st.markdown(
+            "**Columnas:** `code`\\* · `name`\\* · `category` · `spaulding` · "
+            "`service_origin` · `quantity` · `status` · `observations` · "
+            "`manufacturer` · `model` · `max_cycles`  *(\\*obligatorias)*"
+        )
+        uploaded = st.file_uploader(
+            "Seleccionar archivo",
+            type=["csv", "xlsx", "xls"],
+            key="bulk_upload",
+            help="CSV (separado por comas o punto y coma) o Excel (.xlsx / .xls).",
+        )
+        if uploaded is not None:
+            try:
+                if uploaded.name.endswith(".csv"):
+                    raw_bytes = uploaded.read()
+                    # Detectar separador (coma o punto y coma)
+                    sample = raw_bytes[:2048].decode("utf-8", errors="replace")
+                    sep = ";" if sample.count(";") > sample.count(",") else ","
+                    df_up = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, dtype=str)
+                else:
+                    df_up = pd.read_excel(uploaded, dtype=str)
+                df_up = df_up.dropna(how="all").fillna("")
+                st.subheader(f"Vista previa — {len(df_up)} filas detectadas")
+                st.dataframe(df_up.head(10), use_container_width=True)
+                if st.button("⬆️ Confirmar importación", key="bulk_confirm"):
+                    n_ins, skipped, errs = _bulk_import_instruments(df_up.copy(), st.session_state["user"])
+                    audit(st.session_state["user"], "Importación masiva", "Instrumental",
+                          f"{n_ins} insertados, {len(skipped)} omitidos, {len(errs)} errores")
+                    if n_ins:
+                        st.success(f"✅ {n_ins} instrumento(s) importados correctamente.")
+                    if skipped:
+                        st.warning(f"⚠️ {len(skipped)} código(s) omitidos (ya existen): {', '.join(skipped[:20])}")
+                    if errs:
+                        st.error(f"❌ {len(errs)} fila(s) con errores:")
+                        for e in errs[:10]:
+                            st.caption(f"• {e}")
+                    if n_ins:
+                        st.rerun()
+            except Exception as _exc:
+                st.error(f"Error al leer el archivo: {_exc}")
     df=query_df("SELECT * FROM instruments ORDER BY created_at DESC")
     fc1,fc2=st.columns(2)
     q=fc1.text_input("🔍 Buscar por código o nombre")
