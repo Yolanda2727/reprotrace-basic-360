@@ -774,6 +774,31 @@ USERS = {
 
 SEV_ICON  = {"Alta": "🔴", "Media": "🟡", "Baja": "🟢"}
 
+# Tiempos mínimos de duración total por etapa (minutos)
+# Fuentes: AAMI ST79:2017 §6-11, ISO 15883-1:2006, ISO 17664:2017,
+#          OPS/OMS Guía reprocesamiento 2016, Circular 01/2016 Supersalud Colombia
+STAGE_MIN_DURATION = {
+    "Recepción":                         2.0,   # Conteo, revisión y registro (práctica recomendada)
+    "Limpieza y descontaminación":       5.0,   # AAMI ST79 §6.2 / ISO 15883-1 (mínimo manual)
+    "Inspección funcional":              2.0,   # Revisión visual y funcional (práctica recomendada)
+    "Empaque":                           2.0,   # Sellado y etiquetado (práctica recomendada)
+    "Esterilización":                    7.0,   # Ciclo vapor 134°C mínimo (EN 285 / AAMI ST79 Table 11.1)
+    "Validación / liberación de carga":  5.0,   # Lectura indicadores + decisión de liberación
+    "Almacenamiento":                    1.0,   # Ubicación y registro
+    "Distribución":                      1.0,   # Entrega y firma
+}
+
+# Tiempos mínimos de EXPOSICIÓN por tipo de ciclo (minutos)
+# Fuentes: EN 285:2015 §22.3.2, AAMI ST79:2017 Table 11.1,
+#          ISO 11135:2014 §10 (ETO), ISO 22441:2022 (VH2O2/plasma)
+STERIL_MIN_EXPOSURE = {
+    "Vapor 134°C":              3.0,   # EN 285 §22.3.2 / AAMI ST79 Table 11.1
+    "Vapor 121°C":             15.0,   # AAMI ST79 Table 11.1 (15-30 min según carga)
+    "Baja temperatura":        60.0,   # ISO 11135:2014 §10 (óxido de etileno típico)
+    "Peróxido de hidrógeno":   28.0,   # ISO 22441:2022 / AAMI ST58 (plasma VH2O2)
+    "Otro":                     1.0,   # Referirse a instrucciones del fabricante
+}
+
 AUTO_REC = {
     "Indicador biológico no conforme": "Rechazar la carga, inmovilizar el material, repetir el ciclo y notificar al coordinador.",
     "Instrumental dañado":             "Retirar del circuito, reportar novedad, verificar el set y documentar mantenimiento.",
@@ -786,6 +811,8 @@ AUTO_REC = {
     "Paquete dañado en entrega":       "No utilizar el instrumental. Reportar la novedad al servicio receptor, retirar del quirófano y reprocesar desde la etapa de inspección funcional.",
     "Vencimiento próximo":             "Planificar uso o redistribución del lote antes de la fecha de vencimiento. Verificar condiciones de almacenamiento.",
     "Paquete vencido":                 "Retirar inmediatamente del almacenamiento. No distribuir. Evaluar reprocesamiento completo desde Limpieza y descontaminación.",
+    "Tiempo insuficiente en etapa":     "Verificar el registro de fecha/hora de inicio y fin. Si el tiempo fue real, documentar desviación y evaluar reprocesamiento según protocolo del servicio.",
+    "Tiempo de exposición insuficiente": "RECHAZAR LA CARGA. Exposición por debajo del mínimo normativo no garantiza esterilidad. Reprocesar con parámetros correctos y verificar calibración del equipo.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -1565,6 +1592,14 @@ def process_module():
                 st.error(f"🔴 BLOQUEO DE SEGURIDAD: El lote tiene {len(_emq)} alerta(s) de indicador no conforme abiertas. Resuelva las alertas de Empaque antes de esterilizar.")
                 for _,_a in _emq.iterrows(): st.caption(f"• {_a['alert_type']}")
                 return
+            if cy_t and exp_t is not None:
+                _min_exp=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+                if exp_t<_min_exp and cy_t!="Otro":
+                    st.error(f"🔴 BLOQUEO DE SEGURIDAD: El tiempo de exposición registrado ({exp_t:.1f} min) es inferior al "
+                             f"mínimo normativo para '{cy_t}': {_min_exp:.0f} min "
+                             f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). "
+                             "Corríjalo antes de guardar.")
+                    return
         if stage=="Distribución":
             _open=query_df(
                 "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta'",
@@ -1599,6 +1634,18 @@ def process_module():
         if bi_i=="No conforme": add_alert(code,batch.strip(),"Indicador biológico no conforme","Alta","Indicador biológico no conforme. Rechazar carga.")
         if ch_i=="No conforme": add_alert(code,batch.strip(),"Indicador no conforme","Alta","Indicador químico no conforme en validación.")
         if cl_c=="No conforme": add_alert(code,batch.strip(),"Limpieza no conforme","Alta",f"Limpieza no conforme. {cl_n}")
+        # ─ Validación de tiempos mínimos por etapa (AAMI ST79 / ISO 15883 / EN 285)
+        _min_dur=STAGE_MIN_DURATION.get(stage,0)
+        if dur<_min_dur:
+            add_alert(code,batch.strip(),"Tiempo insuficiente en etapa","Media",
+                      f"'{stage}' duró {dur:.1f} min, inferior al mínimo normativo de {_min_dur:.0f} min "
+                      f"(AAMI ST79/ISO 15883/ISO 17664). Verificar registro de fechas/horas.")
+        if stage=="Esterilización" and cy_t and exp_t is not None:
+            _min_exp=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+            if exp_t<_min_exp:
+                add_alert(code,batch.strip(),"Tiempo de exposición insuficiente","Alta",
+                          f"Ciclo '{cy_t}': exposición registrada {exp_t:.1f} min, mínimo normativo {_min_exp:.0f} min "
+                          f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). Rechazar carga.")
         if stage=="Almacenamiento" and p_c in ["Dañado","Vencido"]: add_alert(code,batch.strip(),"Paquete no apto","Alta",f"Paquete en almacenamiento con condición '{p_c}'. No distribuir hasta verificar estado.")
         if stage=="Distribución" and ps=="Dañado": add_alert(code,batch.strip(),"Paquete dañado en entrega","Alta",f"Paquete entregado con daño visible al servicio '{ds}'. Riesgo directo al paciente.")
         if stage=="Distribución":
