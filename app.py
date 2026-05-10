@@ -1125,12 +1125,34 @@ def _migrate_db():
         "CREATE INDEX IF NOT EXISTS idx_nc_alert_id      ON nonconformities(alert_id)",
         "CREATE INDEX IF NOT EXISTS idx_nc_code_batch    ON nonconformities(instrument_code, batch_code)",
         "CREATE INDEX IF NOT EXISTS idx_nc_status        ON nonconformities(status)",
+        "CREATE INDEX IF NOT EXISTS idx_bi_code_batch    ON biological_indicators(instrument_code, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_bi_result        ON biological_indicators(result)",
+        "CREATE INDEX IF NOT EXISTS idx_bi_expected      ON biological_indicators(expected_completion)",
     ]
     for stmt in idx_stmts:
         try:
             c.execute(stmt); c.commit()
         except sqlite3.OperationalError:
             pass
+    # ─ Tabla indicadores biológicos (Mejora V) ──────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS biological_indicators (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_code   TEXT NOT NULL,
+        batch_code        TEXT NOT NULL,
+        sterilizer_id     TEXT,
+        load_number       TEXT,
+        bi_lot            TEXT,
+        bi_brand          TEXT,
+        incubation_start  TEXT NOT NULL,
+        incubation_hours  INTEGER NOT NULL DEFAULT 24,
+        expected_completion TEXT NOT NULL,
+        result            TEXT NOT NULL DEFAULT 'Pendiente',
+        reviewed_by       TEXT,
+        reviewed_at       TEXT,
+        observations      TEXT,
+        registered_by     TEXT,
+        created_at        TEXT)""")
+    c.commit()
     c.close()
 
 def seed_demo_data():
@@ -2002,13 +2024,29 @@ def dashboard():
     rec=query_df("SELECT * FROM process_records")
     al=query_df("SELECT * FROM alerts WHERE status='Abierta'")
     pl=query_df("SELECT * FROM improvement_plans WHERE state='Pendiente'")
-    c1,c2,c3,c4,c5=st.columns(5)
+    bi_pend=query_df("SELECT COUNT(*) as n FROM biological_indicators WHERE result='Pendiente'")
+    bi_pend_n = int(bi_pend.iloc[0]["n"]) if not bi_pend.empty else 0
+    bi_pos=query_df("SELECT COUNT(*) as n FROM biological_indicators WHERE result='Positivo'")
+    bi_pos_n = int(bi_pos.iloc[0]["n"]) if not bi_pos.empty else 0
+    c1,c2,c3,c4,c5,c6=st.columns(6)
     c1.metric("🔧 Instrumentales",len(ins))
     c2.metric("📋 Registros",len(rec))
     c3.metric("🔔 Alertas abiertas",len(al))
     c4.metric("✅ Cumplimiento",f"{(rec['complies']=='Sí').mean()*100:.1f}%" if not rec.empty else "N/A")
     c5.metric("📌 Planes pendientes",len(pl))
+    c6.metric("🧫 IB pendientes", bi_pend_n, help="Indicadores biológicos en incubación o sin lectura")
     red=len(al[al["severity"]=="Alta"]) if not al.empty else 0
+    if bi_pos_n:
+        st.error(f"🚨 {bi_pos_n} INDICADOR(ES) BIOLÓGICO(S) **POSITIVOS** — Revise el módulo '🧫 Indicadores Biológicos'.")
+    if bi_pend_n:
+        bi_over=query_df(
+            "SELECT COUNT(*) as n FROM biological_indicators WHERE result='Pendiente' AND expected_completion<?",
+            (datetime.now().isoformat(),))
+        n_over = int(bi_over.iloc[0]["n"]) if not bi_over.empty else 0
+        if n_over:
+            st.error(f"⏰ {n_over} IB(s) con tiempo de incubación **VENCIDO**. Registre el resultado.")
+        else:
+            st.warning(f"🧫 {bi_pend_n} IB(s) en incubación. Recuerde registrar el resultado al vencer el plazo.")
     if red:   st.error(f"🔴 {red} ALERTA(S) DE RIESGO ALTO ABIERTAS. Revise el módulo de Alertas.")
     elif len(al): st.warning("🟡 Hay alertas abiertas de nivel medio.")
     else:     st.success("🟢 Sin alertas abiertas. Situación controlada.")
@@ -4462,6 +4500,208 @@ def nonconformities_module():
             plt.close(fig_r)
 
 
+# ─── Indicador Biológico / Incubación (Mejora V) ─────────────────────────────
+def biological_indicators_module():
+    """Registro y seguimiento de indicadores biológicos (prueba de esporas).
+
+    Referencia: AAMI ST79:2017 §10.5 / ISO 11138 / Res. 4816/2008 MinSalud.
+    Un resultado POSITIVO activa alerta Alta y sugiere recall del lote afectado.
+    """
+    st.header("🧫 Indicadores Biológicos (Prueba de esporas)")
+    st.caption(
+        "Registro de la prueba de esterilidad mediante indicadores biológicos. "
+        "Referencia: **AAMI ST79:2017 §10.5 / ISO 11138 / Res. 4816/2008 MinSalud Colombia**."
+    )
+
+    tab_reg, tab_seg, tab_hist = st.tabs(["➕ Registrar IB", "⏳ Seguimiento pendientes", "📋 Historial"])
+
+    # ── Tab 1: Registro ───────────────────────────────────────────────────────
+    with tab_reg:
+        st.subheader("Nuevo indicador biológico")
+        ins_df = query_df("SELECT code, name FROM instruments WHERE status='Activo' ORDER BY code")
+        if ins_df.empty:
+            st.warning("Registre primero un instrumental activo."); return
+
+        with st.form("bi_form", clear_on_submit=True):
+            opts = [f"{r.code} – {r.name}" for _, r in ins_df.iterrows()]
+            sel  = st.selectbox("Instrumental *", opts)
+            code = sel.split("–")[0].strip()
+
+            bc1, bc2 = st.columns(2)
+            batch    = bc1.text_input("Lote / carga *", placeholder="LOTE-2026-001")
+            st_id    = bc2.text_input("ID Esterilizador", placeholder="EST-01")
+
+            rc1, rc2 = st.columns(2)
+            load_no  = rc1.text_input("Número de carga", placeholder="C-042")
+            bi_brand = rc2.text_input("Marca del IB", placeholder="3M Attest / Mesa Labs")
+
+            oc1, oc2 = st.columns(2)
+            bi_lot   = oc1.text_input("Lote del IB (del fabricante)", placeholder="L2026-05")
+            inc_h    = oc2.selectbox("Horas de incubación", [24, 48], index=0,
+                                     help="AAMI ST79 §10.5.2: 24 h para lectura rápida, 48 h convencional")
+
+            inc_start = st.datetime_input("Inicio de incubación *",
+                                          value=datetime.now()) if hasattr(st, "datetime_input") else None
+            if inc_start is None:
+                dc1, dc2 = st.columns(2)
+                inc_date = dc1.date_input("Fecha inicio incubación *", value=date.today())
+                inc_time = dc2.time_input("Hora inicio *", value=datetime.now().time())
+                inc_start_dt = datetime.combine(inc_date, inc_time)
+            else:
+                inc_start_dt = inc_start
+
+            obs = st.text_area("Observaciones", placeholder="Posición del IB en la carga, condiciones especiales…")
+
+            submitted = st.form_submit_button("💾 Registrar IB", use_container_width=True)
+
+        if submitted:
+            if not batch.strip():
+                st.error("El campo Lote / carga es obligatorio.")
+            elif not BATCH_PATTERN.match(batch.strip()):
+                st.error(f"Formato de lote inválido. {BATCH_HINT}")
+            else:
+                expected_dt = inc_start_dt + timedelta(hours=int(inc_h))
+                execute(
+                    """INSERT INTO biological_indicators
+                       (instrument_code, batch_code, sterilizer_id, load_number,
+                        bi_lot, bi_brand, incubation_start, incubation_hours,
+                        expected_completion, result, observations, registered_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (code, batch.strip(), st_id.strip() or None, load_no.strip() or None,
+                     bi_lot.strip() or None, bi_brand.strip() or None,
+                     inc_start_dt.isoformat(), int(inc_h),
+                     expected_dt.isoformat(), "Pendiente",
+                     obs.strip() or None,
+                     st.session_state["user"], datetime.now().isoformat())
+                )
+                audit(st.session_state["user"], "Registro IB", "Indicadores biológicos",
+                      f"{code}/{batch.strip()} — Incubación {inc_h} h — Vence: {expected_dt.strftime('%Y-%m-%d %H:%M')}")
+                st.success(
+                    f"✅ IB registrado. Lectura esperada: **{expected_dt.strftime('%d/%m/%Y %H:%M')}**. "
+                    f"Registre el resultado cuando concluya la incubación."
+                )
+
+    # ── Tab 2: Seguimiento de pendientes ──────────────────────────────────────
+    with tab_seg:
+        st.subheader("⏳ IB en incubación / pendientes de lectura")
+        pending = query_df(
+            "SELECT * FROM biological_indicators WHERE result='Pendiente' ORDER BY expected_completion"
+        )
+        if pending.empty:
+            st.info("No hay indicadores biológicos pendientes de lectura. ✅")
+        else:
+            now_str = datetime.now().isoformat()
+            overdue = pending[pending["expected_completion"] < now_str]
+            if not overdue.empty:
+                st.error(f"🚨 **{len(overdue)} IB(s) con tiempo de incubación vencido** — registre el resultado.")
+
+            for _, row in pending.iterrows():
+                exp_dt = datetime.fromisoformat(str(row["expected_completion"]))
+                vencido = exp_dt < datetime.now()
+                icon = "🔴" if vencido else "🟡"
+                with st.expander(
+                    f"{icon} {row['instrument_code']} / {row['batch_code']} — "
+                    f"Vence {exp_dt.strftime('%d/%m/%Y %H:%M')} {'⚠️ VENCIDO' if vencido else ''}",
+                    expanded=vencido
+                ):
+                    dc1, dc2, dc3 = st.columns(3)
+                    dc1.metric("Esterilizador", row.get("sterilizer_id") or "—")
+                    dc2.metric("Marca IB", row.get("bi_brand") or "—")
+                    dc3.metric("Horas incubación", f"{row['incubation_hours']} h")
+
+                    st.write(f"**Inicio incubación:** {row['incubation_start'][:16].replace('T',' ')}")
+                    if row.get("observations"):
+                        st.write(f"**Obs.:** {row['observations']}")
+
+                    with st.form(f"bi_result_{row['id']}"):
+                        new_result = st.radio(
+                            "Resultado de lectura *",
+                            ["Negativo ✅ (conforme)", "Positivo ❌ (NO conforme)"],
+                            horizontal=True,
+                            help="Negativo = sin crecimiento de esporas = esterilización exitosa."
+                        )
+                        rev_obs = st.text_input("Observaciones de lectura")
+                        if st.form_submit_button("✔️ Registrar resultado"):
+                            res_val = "Negativo" if new_result.startswith("Negativo") else "Positivo"
+                            execute(
+                                """UPDATE biological_indicators
+                                   SET result=?, reviewed_by=?, reviewed_at=?, observations=?
+                                   WHERE id=?""",
+                                (res_val, st.session_state["user"],
+                                 datetime.now().isoformat(), rev_obs.strip() or row.get("observations"),
+                                 row["id"])
+                            )
+                            audit(st.session_state["user"], "Lectura IB", "Indicadores biológicos",
+                                  f"ID:{row['id']} {row['instrument_code']}/{row['batch_code']} → {res_val}")
+
+                            if res_val == "Positivo":
+                                add_alert(row["instrument_code"], row["batch_code"],
+                                          "Indicador biológico POSITIVO", "Alta",
+                                          f"IB POSITIVO en lote {row['batch_code']} — "
+                                          f"Esterilizador: {row.get('sterilizer_id','—')}. "
+                                          "Inmovilizar toda la carga, evaluar retiro de lote. "
+                                          "AAMI ST79:2017 §10.5.5 / ISO 11138.")
+                                _trigger_recall(row["instrument_code"], row["batch_code"],
+                                                "Indicador biológico positivo",
+                                                "IB positivo (crecimiento de esporas). Lote potencialmente no estéril.",
+                                                st.session_state["user"])
+                                st.error(
+                                    "🚨 **RESULTADO POSITIVO** — Se generó alerta Alta y se evaluó recall automático. "
+                                    "Inmovilice la carga y notifique al coordinador de la central."
+                                )
+                            else:
+                                st.success("✅ Resultado Negativo registrado. Esterilización confirmada.")
+                            st.rerun()
+
+    # ── Tab 3: Historial ──────────────────────────────────────────────────────
+    with tab_hist:
+        st.subheader("📋 Historial de indicadores biológicos")
+        hc1, hc2, hc3 = st.columns(3)
+        f_code   = hc1.text_input("Filtrar instrumental", key="bi_f_code")
+        f_batch  = hc2.text_input("Filtrar lote", key="bi_f_batch")
+        f_result = hc3.selectbox("Resultado", ["Todos", "Pendiente", "Negativo", "Positivo"], key="bi_f_res")
+
+        hist = query_df("SELECT * FROM biological_indicators ORDER BY created_at DESC")
+        if not hist.empty:
+            if f_code:
+                hist = hist[hist["instrument_code"].str.contains(f_code, case=False, na=False)]
+            if f_batch:
+                hist = hist[hist["batch_code"].str.contains(f_batch, case=False, na=False)]
+            if f_result != "Todos":
+                hist = hist[hist["result"] == f_result]
+
+        if hist.empty:
+            st.info("Sin registros que coincidan con los filtros.")
+        else:
+            # Métricas rápidas
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Total IB", len(hist))
+            mc2.metric("Pendientes", len(hist[hist["result"] == "Pendiente"]))
+            mc3.metric("Negativos ✅", len(hist[hist["result"] == "Negativo"]))
+            mc4.metric("Positivos 🚨", len(hist[hist["result"] == "Positivo"]))
+
+            display_cols = ["id","instrument_code","batch_code","sterilizer_id",
+                            "incubation_hours","expected_completion","result",
+                            "reviewed_by","reviewed_at","registered_by"]
+            st.dataframe(
+                hist[[c for c in display_cols if c in hist.columns]],
+                use_container_width=True
+            )
+
+            # Descarga Excel
+            try:
+                import io as _io2
+                xl_buf = _io2.BytesIO()
+                hist.to_excel(xl_buf, index=False, engine="xlsxwriter")
+                st.download_button(
+                    "📥 Descargar historial Excel",
+                    data=xl_buf.getvalue(),
+                    file_name=f"indicadores_biologicos_{date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception:
+                pass
+
 # ─── Limitaciones ─────────────────────────────────────────────────────────────
 def limitations_module():
     st.header("11. Limitaciones del prototipo")
@@ -4498,7 +4738,7 @@ def main():
     MENU=[
         "🏠 Panel principal","🔧 Registro de instrumental","📋 Registro del proceso",
         "🔍 Consulta de trazabilidad","🚨 Retiro de lote (Recall)","🔔 Alertas y novedades","📌 Plan de mejora",
-        "📊 Reportes e indicadores","🔩 Calibración de equipos","📋 No conformidades","📝 Encuesta de percepción",
+        "📊 Reportes e indicadores","🧫 Indicadores Biológicos","🔩 Calibración de equipos","📋 No conformidades","📝 Encuesta de percepción",
         "🔒 Auditoría de cambios","⚙️ Configuración y respaldo","✅ Plan de pruebas","⚠️ Limitaciones del prototipo",
     ]
     menu=st.sidebar.radio("Menú",MENU)
@@ -4511,6 +4751,7 @@ def main():
         "🔔 Alertas y novedades":alerts_module,
         "📌 Plan de mejora":improvement_module,
         "📊 Reportes e indicadores":reports_module,
+        "🧫 Indicadores Biológicos":biological_indicators_module,
         "🔩 Calibración de equipos":calibration_module,
         "📋 No conformidades":nonconformities_module,
         "📝 Encuesta de percepción":survey_module,
