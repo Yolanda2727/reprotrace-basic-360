@@ -808,6 +808,23 @@ STERIL_MIN_EXPOSURE = {
     "Otro":                     1.0,   # Referirse a instrucciones del fabricante
 }
 
+# Parámetros mínimos de TEMPERATURA y PRESIÓN por tipo de ciclo
+# Fuentes: EN 285:2015 Table 1 §22.3, AAMI ST79:2017 Table 11.1
+STERIL_MIN_TEMP = {
+    "Vapor 134°C":            134.0,   # EN 285:2015 Table 1 / AAMI ST79 Table 11.1
+    "Vapor 121°C":            121.0,   # AAMI ST79 Table 11.1
+    "Baja temperatura":        None,   # varía según agente (ETO, H2O2) — fabricante
+    "Peróxido de hidrógeno":  45.0,   # Sterrad 100NX típico (indicativo)
+    "Otro":                    None,   # según fabricante
+}
+STERIL_MIN_PRESSURE = {                # presion manometrica en bar (relativa)
+    "Vapor 134°C":             2.05,  # EN 285:2015 §22.3 (3.0 bar abs ≈ 2.05 bar manometrico)
+    "Vapor 121°C":             1.04,  # AAMI ST79 Table 11.1 (2.07 bar abs ≈ 1.04 bar manometrico)
+    "Baja temperatura":        None,
+    "Peróxido de hidrógeno":  None,
+    "Otro":                    None,
+}
+
 AUTO_REC = {
     "Indicador biológico no conforme": "Rechazar la carga, inmovilizar el material, repetir el ciclo y notificar al coordinador.",
     "Instrumental dañado":             "Retirar del circuito, reportar novedad, verificar el set y documentar mantenimiento.",
@@ -823,6 +840,9 @@ AUTO_REC = {
     "Tiempo insuficiente en etapa":     "Verificar el registro de fecha/hora de inicio y fin. Si el tiempo fue real, documentar desviación y evaluar reprocesamiento según protocolo del servicio.",
     "Tiempo de exposición insuficiente": "RECHAZAR LA CARGA. Exposición por debajo del mínimo normativo no garantiza esterilidad. Reprocesar con parámetros correctos y verificar calibración del equipo.",
     "Etapa duplicada":                   "Revisar si el segundo registro corresponde a un reproceso justificado o a un error de digitación. Documentar la causa y corregir la trazabilidad del lote.",
+    "Parámetro real insuficiente (temperatura)":  "RECHAZAR LA CARGA. Temperatura real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 / AAMI ST79). Verificar calibración del equipo y reprocesar.",
+    "Parámetro real insuficiente (presión)":      "RECHAZAR LA CARGA. Presión real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 §22.3). Verificar calibración del equipo y reprocesar.",
+    "Parámetro real insuficiente (exposición)":   "RECHAZAR LA CARGA. Tiempo de exposición real registrado en impresión insuficiente. Reprocesar con parámetros correctos y verificar calibración.",
 }
 
 # ─── Base de datos ───────────────────────────────────────────────────────────
@@ -868,6 +888,7 @@ def init_db():
         package_type TEXT, chem_indicator_ext TEXT, chem_indicator_int TEXT,
         sterilizer_id TEXT, cycle_type TEXT, temperature REAL, pressure REAL,
         exposure_time REAL, load_number TEXT,
+        actual_temperature REAL, actual_pressure REAL, actual_exposure_time REAL,
         physical_indicator TEXT, chemical_indicator TEXT,
         biological_indicator TEXT, release_result TEXT,
         release_supervisor TEXT,
@@ -995,6 +1016,9 @@ def _migrate_db():
     for stmt in [
         "ALTER TABLE alerts ADD COLUMN closing_reason TEXT",
         "ALTER TABLE process_records ADD COLUMN release_supervisor TEXT",
+        "ALTER TABLE process_records ADD COLUMN actual_temperature REAL",
+        "ALTER TABLE process_records ADD COLUMN actual_pressure REAL",
+        "ALTER TABLE process_records ADD COLUMN actual_exposure_time REAL",
     ]:
         try:
             c.execute(stmt); c.commit()
@@ -1766,6 +1790,7 @@ def process_module():
         pk_t=ce_e=ce_i=""
         st_e=cy_t=ld_n=""
         temp=pres=exp_t=0.0
+        act_temp=act_pres=act_exp_t=None  # parámetros reales de impresión
         ph_i=ch_i=bi_i=rel=""
         release_sup=""
         sl=s_d=p_c=ex_d=""
@@ -1797,11 +1822,30 @@ def process_module():
             a,b=st.columns(2)
             st_e=a.text_input("Equipo esterilizador",placeholder="EST-01")
             cy_t=b.selectbox("Tipo de ciclo",["Vapor 134°C","Vapor 121°C","Baja temperatura","Peróxido de hidrógeno","Otro"])
-            a2,b2,c2_,d2=st.columns(4)
-            temp=a2.number_input("Temp °C",0.0,250.0,134.0)
-            pres=b2.number_input("Presión",0.0,10.0,2.1)
-            exp_t=c2_.number_input("Exposición (min)",0.0,60.0,4.0)
-            ld_n=d2.text_input("N° carga",placeholder="C-001")
+            ld_n=st.text_input("N° carga",placeholder="C-001")
+            st.markdown("**📌 Parámetros programados (objetivo)**")
+            st.caption("Valores configurados en el equipo antes del ciclo.")
+            pa1,pa2,pa3=st.columns(3)
+            temp=pa1.number_input("Temp. objetivo °C",0.0,250.0,134.0 if cy_t=="Vapor 134°C" else 121.0)
+            pres=pa2.number_input("Presión objetivo (bar)",0.0,10.0,2.1)
+            exp_t=pa3.number_input("Exposición objetivo (min)",0.0,120.0,4.0)
+            st.markdown("**📊 Parámetros reales (impresión / tira gráfica del equipo)**")
+            st.caption("Ingrese los valores que figuren en la impresión o registro del ciclo. "
+                       "Requerido por AAMI ST79:2017 §12 / EN 285:2015 §6.")
+            ra1,ra2,ra3=st.columns(3)
+            act_temp=ra1.number_input("Temp. real °C",0.0,250.0,temp,key="act_temp")
+            act_pres=ra2.number_input("Presión real (bar)",0.0,10.0,pres,key="act_pres")
+            act_exp_t=ra3.number_input("Exposición real (min)",0.0,120.0,exp_t,key="act_exp_t")
+            # Indicadores de desviación en tiempo real
+            _min_t=STERIL_MIN_TEMP.get(cy_t)
+            _min_p=STERIL_MIN_PRESSURE.get(cy_t)
+            _min_e=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+            _flags=[]
+            if _min_t and act_temp<_min_t:   _flags.append(f"Temp. real {act_temp:.1f}°C < mínimo {_min_t:.0f}°C")
+            if _min_p and act_pres<_min_p:   _flags.append(f"Presión real {act_pres:.2f} bar < mínimo {_min_p:.2f} bar")
+            if cy_t!="Otro" and act_exp_t<_min_e: _flags.append(f"Exposición real {act_exp_t:.1f} min < mínimo {_min_e:.0f} min")
+            if _flags:
+                st.error("🔴 Parámetros reales por debajo del mínimo normativo:\n" + "\n".join(f"  • {f}" for f in _flags))
         elif stage=="Validación / liberación de carga":
             a,b,c_=st.columns(3)
             ph_i=a.selectbox("Indicador físico",["Conforme","No conforme","No aplica"])
@@ -1911,6 +1955,25 @@ def process_module():
                              f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). "
                              "Corríjalo antes de guardar.")
                     return
+            # Validación de parámetros REALES (impresión ciclo) ───────────────
+            if act_temp is not None and cy_t not in ("Otro",""):
+                _min_t=STERIL_MIN_TEMP.get(cy_t)
+                _min_p=STERIL_MIN_PRESSURE.get(cy_t)
+                _min_e_r=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+                _real_fails=[]
+                if _min_t and act_temp<_min_t:
+                    _real_fails.append(f"Temperatura real {act_temp:.1f}°C < mínimo normativo {_min_t:.0f}°C")
+                if _min_p and act_pres<_min_p:
+                    _real_fails.append(f"Presión real {act_pres:.2f} bar < mínimo normativo {_min_p:.2f} bar")
+                if act_exp_t<_min_e_r and cy_t!="Otro":
+                    _real_fails.append(f"Exposición real {act_exp_t:.1f} min < mínimo normativo {_min_e_r:.0f} min")
+                if _real_fails:
+                    st.error("🔴 BLOQUEO DE SEGURIDAD — PARÁMETROS REALES INSUFICIENTES:\n"
+                             + "\n".join(f"  • {f}" for f in _real_fails)
+                             + "\n\nLos valores registrados en la impresión del equipo no alcanzan los mínimos "
+                               "normativos (EN 285:2015 / AAMI ST79:2017). No se garantiza la esterilidad. "
+                               "Rechace la carga y reprocese.")
+                    return
         if stage=="Distribución":
             _open=query_df(
                 "SELECT alert_type FROM alerts WHERE instrument_code=? AND batch_code=? AND status='Abierta' AND severity='Alta'",
@@ -1927,14 +1990,16 @@ def process_module():
             inspection_status,
             package_type,chem_indicator_ext,chem_indicator_int,
             sterilizer_id,cycle_type,temperature,pressure,exposure_time,load_number,
+            actual_temperature,actual_pressure,actual_exposure_time,
             physical_indicator,chemical_indicator,biological_indicator,release_result,release_supervisor,
             storage_location,storage_date,package_condition,expiration_date,
             destination_service,delivery_responsible,reception_responsible,package_state_delivery,
             observations,registered_by,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (code,batch.strip(),stage,resp,s_dt.isoformat(),e_dt.isoformat(),dur,complies,result,
              r_ori,r_sta,r_qty,cl_m,cl_c,cl_n,ins_s,pk_t,ce_e,ce_i,
-             st_e,cy_t,temp,pres,exp_t,ld_n,ph_i,ch_i,bi_i,rel,release_sup.strip(),
+             st_e,cy_t,temp,pres,exp_t,ld_n,act_temp,act_pres,act_exp_t,
+             ph_i,ch_i,bi_i,rel,release_sup.strip(),
              sl,s_d,p_c,ex_d,ds,dr,rr,ps,obs,st.session_state["user"],datetime.now().isoformat()))
         audit(st.session_state["user"],"Registro etapa","Proceso",f"{code}/{batch}/{stage}")
         if stage=="Validación / liberación de carga" and rel=="Aprobado":
@@ -1975,6 +2040,22 @@ def process_module():
                 add_alert(code,batch.strip(),"Tiempo de exposición insuficiente","Alta",
                           f"Ciclo '{cy_t}': exposición registrada {exp_t:.1f} min, mínimo normativo {_min_exp:.0f} min "
                           f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). Rechazar carga.")
+        # ─ Alertas por parámetros REALES insuficientes (AAMI ST79:2017 §12 / EN 285:2015) ──
+        if stage=="Esterilización" and cy_t and act_temp is not None and cy_t not in ("Otro",""):
+            _mn_t=STERIL_MIN_TEMP.get(cy_t); _mn_p=STERIL_MIN_PRESSURE.get(cy_t)
+            _mn_e=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+            if _mn_t and act_temp<_mn_t:
+                add_alert(code,batch.strip(),"Parámetro real insuficiente (temperatura)","Alta",
+                          f"Temperatura real: {act_temp:.1f}°C < mínimo: {_mn_t:.0f}°C "
+                          f"(EN 285:2015 / AAMI ST79 Table 11.1). No se garantiza esterilidad. Rechazar carga.")
+            if _mn_p and act_pres<_mn_p:
+                add_alert(code,batch.strip(),"Parámetro real insuficiente (presión)","Alta",
+                          f"Presión real: {act_pres:.2f} bar < mínimo: {_mn_p:.2f} bar "
+                          f"(EN 285:2015 §22.3). No se garantiza esterilidad. Rechazar carga.")
+            if act_exp_t<_mn_e:
+                add_alert(code,batch.strip(),"Parámetro real insuficiente (exposición)","Alta",
+                          f"Exposición real: {act_exp_t:.1f} min < mínimo: {_mn_e:.0f} min "
+                          f"(EN 285 / AAMI ST79 Table 11.1). No se garantiza esterilidad. Rechazar carga.")
         if stage=="Almacenamiento" and p_c in ["Dañado","Vencido"]: add_alert(code,batch.strip(),"Paquete no apto","Alta",f"Paquete en almacenamiento con condición '{p_c}'. No distribuir hasta verificar estado.")
         if stage=="Distribución" and ps=="Dañado": add_alert(code,batch.strip(),"Paquete dañado en entrega","Alta",f"Paquete entregado con daño visible al servicio '{ds}'. Riesgo directo al paciente.")
         if stage=="Distribución":
