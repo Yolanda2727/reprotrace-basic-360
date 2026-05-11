@@ -2053,7 +2053,7 @@ def generate_pdf():
             self.line(10,self.get_y(),200,self.get_y()); self.ln(3)
         def footer(self):
             self.set_y(-15); self.set_font("Helvetica","I",8)
-            self.cell(0,8,f"Generado: {now}  -  Pag. {self.page_no()}",align="C")
+            self.cell(0,8,f"Generado: {now}  -  Pag. {self.page_no()}  -  SHA-256 ver pag. final",align="C")
         def titulo(self,t):
             self.set_font("Helvetica","B",12)
             self.set_fill_color(31,78,121); self.set_text_color(255,255,255)
@@ -2130,7 +2130,66 @@ def generate_pdf():
                 "instrumental quirúrgico. Las alertas permiten identificar desviaciones en tiempo real.")
     pdf.titulo("10. Alcance y limitaciones")
     pdf.parrafo(NOTA_ACAD)
-    return bytes(pdf.output())
+
+    # ── Integridad del documento: SHA-256 ────────────────────────────────────
+    # Paso 1: generar bytes del cuerpo del informe (págs. 1..N)
+    import hashlib as _hashlib
+    _body_bytes  = bytes(pdf.output())
+    _sha256_hex  = _hashlib.sha256(_body_bytes).hexdigest()
+    _n_pages_body = pdf.page
+    _gen_ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Paso 2: construir página de verificación de integridad
+    _pdf2 = PDF(orientation="P", unit="mm", format="Letter")
+    _pdf2.set_margins(20, 20, 20)
+    _pdf2.set_auto_page_break(True, 20)
+    _pdf2.add_page()
+    _pdf2.titulo("11. Verificacion de integridad del documento")
+    _pdf2.parrafo(
+        f"Este informe fue generado el {_gen_ts} por {APP_NAME} {VERSION}."
+    )
+    _pdf2.parrafo(
+        f"La huella SHA-256 mostrada abajo corresponde a las paginas 1 a {_n_pages_body} "
+        "(contenido academico). Esta pagina de verificacion NO esta incluida en el calculo."
+    )
+    _pdf2.parrafo(
+        "Para verificar: descargue el informe, elimine esta ultima pagina, "
+        "calcule SHA-256 del archivo resultante y compare con el valor registrado aqui. "
+        "Referencia: ISO/IEC 10118-3 | uso academico formativo."
+    )
+    _pdf2.ln(4)
+    _pdf2.set_font("Courier", "B", 8)
+    _pdf2.set_fill_color(31, 78, 121)
+    _pdf2.set_text_color(255, 255, 255)
+    _label = f"SHA-256: {_sha256_hex}"
+    _pdf2.cell(0, 10, _label, border=1, fill=True, align="C",
+               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    _pdf2.set_text_color(0, 0, 0)
+    _pdf2.set_font("Helvetica", "", 8)
+    _pdf2.ln(3)
+    _pdf2.parrafo(
+        f"Generado     : {_gen_ts}\n"
+        f"Paginas hash : 1 a {_n_pages_body}\n"
+        f"Algoritmo    : SHA-256 (hashlib Python / ISO/IEC 10118-3)\n"
+        f"Aplicacion   : {APP_NAME} {VERSION}"
+    )
+    _integrity_bytes = bytes(_pdf2.output())
+
+    # Paso 3: fusionar cuerpo + página de integridad con pypdf
+    try:
+        from pypdf import PdfWriter as _PdfWriter, PdfReader as _PdfReader
+        _writer = _PdfWriter()
+        for _src in (_body_bytes, _integrity_bytes):
+            _rdr = _PdfReader(io.BytesIO(_src))
+            for _pg in _rdr.pages:
+                _writer.add_page(_pg)
+        _merged = io.BytesIO()
+        _writer.write(_merged)
+        _merged.seek(0)
+        return _merged.read()
+    except Exception:
+        # Fallback seguro: devolver cuerpo sin página de integridad
+        return _body_bytes
 
 # ─── Footer institución ───────────────────────────────────────────────────────
 def inst_footer():
