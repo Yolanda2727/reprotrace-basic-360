@@ -479,25 +479,71 @@ def render_login_card():
 
         st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
 
+        # ── Rate-limiting: máx. 5 intentos fallidos, bloqueo 5 min ───────
+        # Referencia: OWASP A07:2021 — Identification and Authentication Failures
+        _MAX_ATTEMPTS  = 5          # intentos fallidos antes del bloqueo
+        _LOCKOUT_SECS  = 300        # segundos de bloqueo (5 min)
+        _attempts      = st.session_state.get("_login_attempts", 0)
+        _lockout_until = st.session_state.get("_login_lockout_until", None)
+        _now_ts        = datetime.now().timestamp()
+
+        # ¿Bloqueo activo?
+        _locked = _lockout_until is not None and _now_ts < _lockout_until
+        if _locked:
+            _secs_left = int(_lockout_until - _now_ts)
+            st.error(
+                f"🔒 Demasiados intentos fallidos. "
+                f"Espera **{_secs_left // 60}:{_secs_left % 60:02d}** min antes de volver a intentarlo.",
+            )
+
         # ── Botón Ingresar ────────────────────────────────────────────────
-        if st.button("▶  Ingresar al sistema", use_container_width=True, key="btn_login"):
+        if not _locked and st.button("▶  Ingresar al sistema", use_container_width=True, key="btn_login"):
             db_user = get_user(u)
+            _auth_ok = False
+            _role    = None
+
             if db_user and _check_password(p, db_user["password"]):
-                role = db_user["role"]
-                st.session_state.update({"login": True, "user": u, "role": role})
-                execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
-                        (u, role, "Inicio de sesión", datetime.now().isoformat()))
-                audit(u, "Inicio de sesión", "Login")
-                st.rerun()
+                _auth_ok = True
+                _role    = db_user["role"]
             elif u in USERS and _check_password(p, USERS[u]["password"]):
-                role = USERS[u]["role"]
-                st.session_state.update({"login": True, "user": u, "role": role})
-                execute("INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
-                        (u, role, "Inicio de sesión", datetime.now().isoformat()))
+                _auth_ok = True
+                _role    = USERS[u]["role"]
+
+            if _auth_ok:
+                # Éxito: limpiar contadores y registrar sesión
+                st.session_state.pop("_login_attempts",     None)
+                st.session_state.pop("_login_lockout_until", None)
+                st.session_state.update({"login": True, "user": u, "role": _role})
+                execute(
+                    "INSERT INTO login_sessions(username,role,event,timestamp) VALUES(?,?,?,?)",
+                    (u, _role, "Inicio de sesión", datetime.now().isoformat()),
+                )
                 audit(u, "Inicio de sesión", "Login")
                 st.rerun()
             else:
-                st.error("⚠️ Usuario o contraseña incorrectos.")
+                # Fallo: incrementar contador
+                _attempts += 1
+                st.session_state["_login_attempts"] = _attempts
+                _remaining = _MAX_ATTEMPTS - _attempts
+
+                if _remaining <= 0:
+                    # Activar bloqueo temporal
+                    st.session_state["_login_lockout_until"] = _now_ts + _LOCKOUT_SECS
+                    audit(
+                        u or "desconocido",
+                        "Bloqueo por intentos fallidos",
+                        "Login",
+                        f"IP-session bloqueada tras {_MAX_ATTEMPTS} intentos fallidos.",
+                    )
+                    st.error(
+                        f"🔒 Cuenta bloqueada temporalmente ({_LOCKOUT_SECS // 60} min) "
+                        "por exceso de intentos fallidos. (OWASP A07)"
+                    )
+                else:
+                    st.error(
+                        f"⚠️ Usuario o contraseña incorrectos. "
+                        f"Intentos restantes: **{_remaining}**."
+                    )
 
         # ── Usuarios de prueba ────────────────────────────────────────────
         st.markdown("""
