@@ -361,6 +361,23 @@ STERIL_MIN_PRESSURE = {                # presion manometrica en bar (relativa)
     "Peróxido de hidrógeno":  None,
     "Otro":                    None,
 }
+# Cotas MÁXIMAS de temperatura y presión — EN 285:2015 Table 1 / ISO 17665-1:2006 §8.3
+# Vapor 134°C: banda normativa 134–137 °C / 3.0–3.4 bar abs (2.05–2.35 bar man.)
+# Vapor 121°C: banda normativa 121–124 °C / 2.07–2.27 bar abs (1.04–1.24 bar man.)
+STERIL_MAX_TEMP = {
+    "Vapor 134°C":            137.0,   # EN 285:2015 Table 1 — límite superior de banda
+    "Vapor 121°C":            124.0,   # EN 285:2015 Table 1 — límite superior de banda
+    "Baja temperatura":        None,
+    "Peróxido de hidrógeno":  None,
+    "Otro":                    None,
+}
+STERIL_MAX_PRESSURE = {               # bar manometrico — cota superior de banda normativa
+    "Vapor 134°C":             2.35,  # EN 285:2015 §22.3 (3.4 bar abs ≈ 2.35 bar man.)
+    "Vapor 121°C":             1.24,  # EN 285:2015 Table 1 (2.27 bar abs ≈ 1.24 bar man.)
+    "Baja temperatura":        None,
+    "Peróxido de hidrógeno":  None,
+    "Otro":                    None,
+}
 
 AUTO_REC = {
     "Indicador biológico no conforme": "Rechazar la carga, inmovilizar el material, repetir el ciclo y notificar al coordinador.",
@@ -380,6 +397,8 @@ AUTO_REC = {
     "Parámetro real insuficiente (temperatura)":  "RECHAZAR LA CARGA. Temperatura real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 / AAMI ST79). Verificar calibración del equipo y reprocesar.",
     "Parámetro real insuficiente (presión)":      "RECHAZAR LA CARGA. Presión real registrada en impresión no alcanzó el mínimo normativo (EN 285:2015 §22.3). Verificar calibración del equipo y reprocesar.",
     "Parámetro real insuficiente (exposición)":   "RECHAZAR LA CARGA. Tiempo de exposición real registrado en impresión insuficiente. Reprocesar con parámetros correctos y verificar calibración.",
+    "Parámetro fuera de rango (temperatura)": "RECHAZAR LA CARGA. Temperatura fuera de la banda normativa EN 285:2015 Table 1 / ISO 17665-1. Verificar calibración del equipo, documentar desviación y reprocesar.",
+    "Parámetro fuera de rango (presión)":     "RECHAZAR LA CARGA. Presión fuera de la banda normativa EN 285:2015 §22.3 / ISO 17665-1. Verificar calibración del equipo, documentar desviación y reprocesar.",
     "Límite de ciclos superado":                  "RETIRAR DEL CIRCUITO. El instrumental superó el límite de ciclos de reprocesamiento indicado por el fabricante (ISO 17664:2017). Dar de baja, documentar disposición final y reemplazar.",
     "Ciclos próximos al límite":                  "Planificar reemplazo del instrumental. Está próximo al límite de ciclos del fabricante (ISO 17664:2017). No descartarlo aún, pero gestionar adquisición de reemplazo.",
     "Equipo sin calibración vigente":             "BLOQUEAR uso del equipo. No esterilizar hasta obtener certificado de calibración vigente. Contactar entidad metrológica acreditada (ISO 17665-1 / ISO 15883-1 / Res. 4816/2008).",
@@ -2362,12 +2381,33 @@ def process_module():
             st_e=a.text_input("Equipo esterilizador",placeholder="EST-01")
             cy_t=b.selectbox("Tipo de ciclo",["Vapor 134°C","Vapor 121°C","Baja temperatura","Peróxido de hidrógeno","Otro"])
             ld_n=st.text_input("N° carga",placeholder="C-001")
+            # ── Rango normativo para el tipo de ciclo seleccionado ────────────────
+            _mn_t_f = STERIL_MIN_TEMP.get(cy_t)
+            _mx_t_f = STERIL_MAX_TEMP.get(cy_t)
+            _mn_p_f = STERIL_MIN_PRESSURE.get(cy_t)
+            _mx_p_f = STERIL_MAX_PRESSURE.get(cy_t)
+            _mn_e_f = STERIL_MIN_EXPOSURE.get(cy_t, 1.0)
+            if cy_t not in ("Otro", "") and (_mn_t_f or _mn_p_f):
+                _rng_parts = []
+                if _mn_t_f: _rng_parts.append(f"Temp.: {_mn_t_f:.0f}–{_mx_t_f:.0f} °C" if _mx_t_f else f"Temp. ≥ {_mn_t_f:.0f} °C")
+                if _mn_p_f: _rng_parts.append(f"Presión: {_mn_p_f:.2f}–{_mx_p_f:.2f} bar" if _mx_p_f else f"Presión ≥ {_mn_p_f:.2f} bar")
+                _rng_parts.append(f"Exposición ≥ {_mn_e_f:.0f} min")
+                st.info("🔬 **Rango normativo ISO 17665-1 / EN 285:2015 para '" + cy_t + "':** " + " · ".join(_rng_parts))
             st.markdown("**📌 Parámetros programados (objetivo)**")
             st.caption("Valores configurados en el equipo antes del ciclo.")
             pa1,pa2,pa3=st.columns(3)
             temp=pa1.number_input("Temp. objetivo °C",0.0,250.0,134.0 if cy_t=="Vapor 134°C" else 121.0)
             pres=pa2.number_input("Presión objetivo (bar)",0.0,10.0,2.1)
             exp_t=pa3.number_input("Exposición objetivo (min)",0.0,120.0,4.0)
+            # Indicador inline: parámetros PROGRAMADOS fuera de rango
+            _prog_flags = []
+            if _mn_t_f and temp < _mn_t_f:  _prog_flags.append(f"Temp. objetivo {temp:.1f}°C < mínimo {_mn_t_f:.0f}°C")
+            if _mx_t_f and temp > _mx_t_f:  _prog_flags.append(f"Temp. objetivo {temp:.1f}°C > máximo de banda {_mx_t_f:.0f}°C")
+            if _mn_p_f and pres < _mn_p_f:  _prog_flags.append(f"Presión objetivo {pres:.2f} bar < mínimo {_mn_p_f:.2f} bar")
+            if _mx_p_f and pres > _mx_p_f:  _prog_flags.append(f"Presión objetivo {pres:.2f} bar > máximo de banda {_mx_p_f:.2f} bar")
+            if cy_t != "Otro" and exp_t < _mn_e_f: _prog_flags.append(f"Exposición objetivo {exp_t:.1f} min < mínimo {_mn_e_f:.0f} min")
+            if _prog_flags:
+                st.warning("⚠️ Parámetros programados fuera del rango normativo (EN 285:2015 / ISO 17665-1):\n" + "\n".join(f"  • {f}" for f in _prog_flags))
             st.markdown("**📊 Parámetros reales (impresión / tira gráfica del equipo)**")
             st.caption("Ingrese los valores que figuren en la impresión o registro del ciclo. "
                        "Requerido por AAMI ST79:2017 §12 / EN 285:2015 §6.")
@@ -2375,16 +2415,15 @@ def process_module():
             act_temp=ra1.number_input("Temp. real °C",0.0,250.0,temp,key="act_temp")
             act_pres=ra2.number_input("Presión real (bar)",0.0,10.0,pres,key="act_pres")
             act_exp_t=ra3.number_input("Exposición real (min)",0.0,120.0,exp_t,key="act_exp_t")
-            # Indicadores de desviación en tiempo real
-            _min_t=STERIL_MIN_TEMP.get(cy_t)
-            _min_p=STERIL_MIN_PRESSURE.get(cy_t)
-            _min_e=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
+            # Indicadores de desviación en tiempo real — parámetros REALES (min Y max)
             _flags=[]
-            if _min_t and act_temp<_min_t:   _flags.append(f"Temp. real {act_temp:.1f}°C < mínimo {_min_t:.0f}°C")
-            if _min_p and act_pres<_min_p:   _flags.append(f"Presión real {act_pres:.2f} bar < mínimo {_min_p:.2f} bar")
-            if cy_t!="Otro" and act_exp_t<_min_e: _flags.append(f"Exposición real {act_exp_t:.1f} min < mínimo {_min_e:.0f} min")
+            if _mn_t_f and act_temp < _mn_t_f: _flags.append(f"Temp. real {act_temp:.1f}°C < mínimo normativo {_mn_t_f:.0f}°C")
+            if _mx_t_f and act_temp > _mx_t_f: _flags.append(f"Temp. real {act_temp:.1f}°C > banda máxima {_mx_t_f:.0f}°C — riesgo de daño al material")
+            if _mn_p_f and act_pres < _mn_p_f: _flags.append(f"Presión real {act_pres:.2f} bar < mínimo normativo {_mn_p_f:.2f} bar")
+            if _mx_p_f and act_pres > _mx_p_f: _flags.append(f"Presión real {act_pres:.2f} bar > banda máxima {_mx_p_f:.2f} bar — riesgo de daño al material")
+            if cy_t != "Otro" and act_exp_t < _mn_e_f: _flags.append(f"Exposición real {act_exp_t:.1f} min < mínimo {_mn_e_f:.0f} min")
             if _flags:
-                st.error("🔴 Parámetros reales por debajo del mínimo normativo:\n" + "\n".join(f"  • {f}" for f in _flags))
+                st.error("🔴 Parámetros reales fuera del rango normativo (EN 285:2015 / ISO 17665-1):\n" + "\n".join(f"  • {f}" for f in _flags))
         elif stage=="Validación / liberación de carga":
             a,b,c_=st.columns(3)
             ph_i=a.selectbox("Indicador físico",["Conforme","No conforme","No aplica"])
@@ -2558,23 +2597,29 @@ def process_module():
                             return
                     except (ValueError, TypeError):
                         pass
-            # Validación de parámetros REALES (impresión ciclo) ───────────────
+            # Validación de parámetros REALES (impresión ciclo) — mínimos Y máximos ─
             if act_temp is not None and cy_t not in ("Otro",""):
                 _min_t=STERIL_MIN_TEMP.get(cy_t)
+                _max_t=STERIL_MAX_TEMP.get(cy_t)
                 _min_p=STERIL_MIN_PRESSURE.get(cy_t)
+                _max_p=STERIL_MAX_PRESSURE.get(cy_t)
                 _min_e_r=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
                 _real_fails=[]
                 if _min_t and act_temp<_min_t:
-                    _real_fails.append(f"Temperatura real {act_temp:.1f}°C < mínimo normativo {_min_t:.0f}°C")
+                    _real_fails.append(f"Temperatura real {act_temp:.1f}°C < mínimo normativo {_min_t:.0f}°C (EN 285:2015 / ISO 17665-1)")
+                if _max_t and act_temp>_max_t:
+                    _real_fails.append(f"Temperatura real {act_temp:.1f}°C > banda máxima {_max_t:.0f}°C — fuera del rango normativo (EN 285:2015 Table 1)")
                 if _min_p and act_pres<_min_p:
-                    _real_fails.append(f"Presión real {act_pres:.2f} bar < mínimo normativo {_min_p:.2f} bar")
+                    _real_fails.append(f"Presión real {act_pres:.2f} bar < mínimo normativo {_min_p:.2f} bar (EN 285:2015 §22.3)")
+                if _max_p and act_pres>_max_p:
+                    _real_fails.append(f"Presión real {act_pres:.2f} bar > banda máxima {_max_p:.2f} bar — fuera del rango normativo (EN 285:2015 §22.3)")
                 if act_exp_t<_min_e_r and cy_t!="Otro":
                     _real_fails.append(f"Exposición real {act_exp_t:.1f} min < mínimo normativo {_min_e_r:.0f} min")
                 if _real_fails:
-                    st.error("🔴 BLOQUEO DE SEGURIDAD — PARÁMETROS REALES INSUFICIENTES:\n"
+                    st.error("🔴 BLOQUEO DE SEGURIDAD — PARÁMETROS REALES FUERA DEL RANGO NORMATIVO:\n"
                              + "\n".join(f"  • {f}" for f in _real_fails)
-                             + "\n\nLos valores registrados en la impresión del equipo no alcanzan los mínimos "
-                               "normativos (EN 285:2015 / AAMI ST79:2017). No se garantiza la esterilidad. "
+                             + "\n\nLos valores registrados en la impresión del equipo están fuera de la banda "
+                               "normativa ISO 17665-1:2006 / EN 285:2015. No se garantiza la esterilidad. "
                                "Rechace la carga y reprocese.")
                     return
         if stage=="Distribución":
@@ -2643,22 +2688,31 @@ def process_module():
                 add_alert(code,batch.strip(),"Tiempo de exposición insuficiente","Alta",
                           f"Ciclo '{cy_t}': exposición registrada {exp_t:.1f} min, mínimo normativo {_min_exp:.0f} min "
                           f"(EN 285 / AAMI ST79 Table 11.1 / ISO 11135 / ISO 22441). Rechazar carga.")
-        # ─ Alertas por parámetros REALES insuficientes (AAMI ST79:2017 §12 / EN 285:2015) ──
+        # ─ Alertas por parámetros REALES fuera del rango normativo (ISO 17665-1 / EN 285:2015) ─
         if stage=="Esterilización" and cy_t and act_temp is not None and cy_t not in ("Otro",""):
-            _mn_t=STERIL_MIN_TEMP.get(cy_t); _mn_p=STERIL_MIN_PRESSURE.get(cy_t)
+            _mn_t=STERIL_MIN_TEMP.get(cy_t);  _mx_t=STERIL_MAX_TEMP.get(cy_t)
+            _mn_p=STERIL_MIN_PRESSURE.get(cy_t); _mx_p=STERIL_MAX_PRESSURE.get(cy_t)
             _mn_e=STERIL_MIN_EXPOSURE.get(cy_t,1.0)
             if _mn_t and act_temp<_mn_t:
                 add_alert(code,batch.strip(),"Parámetro real insuficiente (temperatura)","Alta",
-                          f"Temperatura real: {act_temp:.1f}°C < mínimo: {_mn_t:.0f}°C "
-                          f"(EN 285:2015 / AAMI ST79 Table 11.1). No se garantiza esterilidad. Rechazar carga.")
+                          f"Temp. real {act_temp:.1f}°C < mínimo {_mn_t:.0f}°C "
+                          f"(EN 285:2015 Table 1 / ISO 17665-1 / AAMI ST79). No se garantiza esterilidad. Rechazar carga.")
+            if _mx_t and act_temp>_mx_t:
+                add_alert(code,batch.strip(),"Parámetro fuera de rango (temperatura)","Alta",
+                          f"Temp. real {act_temp:.1f}°C > banda máxima {_mx_t:.0f}°C "
+                          f"(EN 285:2015 Table 1 / ISO 17665-1). Fuera de rango normativo. Verificar equipo y rechazar carga.")
             if _mn_p and act_pres<_mn_p:
                 add_alert(code,batch.strip(),"Parámetro real insuficiente (presión)","Alta",
-                          f"Presión real: {act_pres:.2f} bar < mínimo: {_mn_p:.2f} bar "
-                          f"(EN 285:2015 §22.3). No se garantiza esterilidad. Rechazar carga.")
+                          f"Presión real {act_pres:.2f} bar < mínimo {_mn_p:.2f} bar "
+                          f"(EN 285:2015 §22.3 / ISO 17665-1). No se garantiza esterilidad. Rechazar carga.")
+            if _mx_p and act_pres>_mx_p:
+                add_alert(code,batch.strip(),"Parámetro fuera de rango (presión)","Alta",
+                          f"Presión real {act_pres:.2f} bar > banda máxima {_mx_p:.2f} bar "
+                          f"(EN 285:2015 §22.3 / ISO 17665-1). Fuera de rango normativo. Verificar equipo y rechazar carga.")
             if act_exp_t<_mn_e:
                 add_alert(code,batch.strip(),"Parámetro real insuficiente (exposición)","Alta",
-                          f"Exposición real: {act_exp_t:.1f} min < mínimo: {_mn_e:.0f} min "
-                          f"(EN 285 / AAMI ST79 Table 11.1). No se garantiza esterilidad. Rechazar carga.")
+                          f"Exposición real {act_exp_t:.1f} min < mínimo {_mn_e:.0f} min "
+                          f"(EN 285 / AAMI ST79 Table 11.1 / ISO 17665-1). No se garantiza esterilidad. Rechazar carga.")
         if stage=="Almacenamiento" and p_c in ["Dañado","Vencido"]: add_alert(code,batch.strip(),"Paquete no apto","Alta",f"Paquete en almacenamiento con condición '{p_c}'. No distribuir hasta verificar estado.")
         if stage=="Distribución" and ps=="Dañado": add_alert(code,batch.strip(),"Paquete dañado en entrega","Alta",f"Paquete entregado con daño visible al servicio '{ds}'. Riesgo directo al paciente.")
         if stage=="Distribución":
