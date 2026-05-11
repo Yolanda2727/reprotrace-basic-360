@@ -3227,7 +3227,97 @@ def traceability_module():
     for _,r in df.iterrows():
         ic="✅" if r["complies"]=="Sí" else "❌"
         st.markdown(f"**{r['stage']}** {ic} | {r['start_datetime']} → {r['end_datetime']} | {r['duration_minutes']:.1f} min | Resp: {r['responsible']} | {r['result']}")
-    st.subheader("Datos completos"); st.dataframe(df,use_container_width=True)
+
+    # ── Línea de tiempo visual exportable como PNG ────────────────────────────
+    if not df.empty:
+        _plt_tl = _get_plt()
+        _n_stages = len(df)
+        _fig_tl, _ax_tl = _plt_tl.subplots(figsize=(12, max(3, _n_stages * 0.75)))
+        _fig_tl.patch.set_facecolor("#0d1b35")
+        _ax_tl.set_facecolor("#0d1b35")
+
+        _colors_tl = {
+            "✅ Conforme":  "#22c55e",
+            "Conforme":     "#22c55e",
+            "Rechazado":    "#ef4444",
+            "Pendiente":    "#f59e0b",
+        }
+        _stage_colors = []
+        for _, _sr in df.iterrows():
+            _res = str(_sr.get("result", "")).strip()
+            _cpl = str(_sr.get("complies", "")).strip()
+            if _res == "Rechazado":
+                _stage_colors.append("#ef4444")
+            elif _cpl == "Sí":
+                _stage_colors.append("#22c55e")
+            elif _cpl == "No":
+                _stage_colors.append("#f59e0b")
+            else:
+                _stage_colors.append("#3b82f6")
+
+        _y_pos = list(range(_n_stages - 1, -1, -1))  # invertido: etapa 1 arriba
+        _dur_vals = df["duration_minutes"].fillna(0).values
+
+        _bars = _ax_tl.barh(
+            _y_pos, _dur_vals,
+            color=_stage_colors, height=0.55,
+            edgecolor="rgba(255,255,255,0.12)", linewidth=0.5,
+        )
+
+        #  Etiquetas izquierda: nombre etapa
+        for _i, (_, _sr) in enumerate(df.iterrows()):
+            _ic  = "✅" if _sr.get("complies") == "Sí" else ("❌" if _sr.get("complies") == "No" else "🔹")
+            _lbl = f"{_ic} {_sr['stage']}"
+            _ax_tl.text(-0.5, _y_pos[_i], _lbl, va="center", ha="right",
+                        fontsize=8.5, color="#e2e8f0", fontweight="bold")
+            # Etiqueta derecha: duración + responsable
+            _dur_str = f"{_sr['duration_minutes']:.1f} min" if _sr['duration_minutes'] else "—"
+            _resp    = str(_sr.get("responsible", "")).strip()[:18]
+            _result  = str(_sr.get("result", "")).strip()
+            _right   = f"{_dur_str}  |  {_resp}  |  {_result}"
+            _ax_tl.text(
+                max(_dur_vals) * 0.02 + _dur_vals[_i] if _dur_vals[_i] > 0 else 0.5,
+                _y_pos[_i], _right,
+                va="center", ha="left", fontsize=7.5, color="#cbd5e1",
+            )
+
+        # Línea de conexión entre etapas (representación temporal)
+        if _n_stages > 1:
+            _ax_tl.plot(
+                [0] * _n_stages, _y_pos,
+                color="#00d4ff", linewidth=1.5, linestyle=":", alpha=0.5, zorder=0,
+            )
+
+        _ax_tl.set_yticks([])
+        _ax_tl.set_xlabel("Duración (minutos)", color="#7fb3d3", fontsize=9)
+        _ax_tl.tick_params(colors="#7fb3d3")
+        for _spine in _ax_tl.spines.values():
+            _spine.set_edgecolor("#1e3a5f")
+
+        _inst_name_row2 = query_df("SELECT name FROM instruments WHERE code=?", (code,))
+        _inst_name2 = _inst_name_row2.iloc[0]["name"] if not _inst_name_row2.empty else code
+        _ax_tl.set_title(
+            f"Línea de tiempo — {_inst_name2} / Lote: {batch}\n"
+            f"ReproTrace Basic 360° · {date.today().isoformat()}",
+            color="#e2e8f0", fontsize=10, pad=10,
+        )
+        _fig_tl.tight_layout(pad=1.5)
+
+        st.pyplot(_fig_tl)
+
+        _png_bytes = fig_bytes(_fig_tl)
+        _plt_tl.close(_fig_tl)
+
+        st.download_button(
+            label="📥 Descargar línea de tiempo (PNG)",
+            data=_png_bytes,
+            file_name=f"trazabilidad_{code}_{batch}_{date.today()}.png",
+            mime="image/png",
+            use_container_width=False,
+            help="Imagen lista para incluir en informes físicos o presentaciones académicas.",
+        )
+
+    st.subheader("Datos completos"); st.dataframe(df, use_container_width=True)
     al=query_df("SELECT * FROM alerts WHERE instrument_code=? AND batch_code=?",(code,batch))
     st.subheader("Alertas asociadas")
     if not al.empty:
