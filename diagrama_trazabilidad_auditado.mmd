@@ -1,19 +1,151 @@
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#0f3460','primaryTextColor':'#e2e8f0','primaryBorderColor':'#00d4ff','lineColor':'#7fb3d3','background':'#0a0e1a','nodeBorder':'#1e3a5f','clusterBkg':'#0d1b35','titleColor':'#00d4ff','edgeLabelBackground':'#0d1b35'}}}%%
 flowchart TD
-    A[Recepción instrumental contaminado] --> B[Registro en ReproTrace Basic 360]
-    B --> C[Asignación código instrumental y lote]
-    C --> D[Limpieza y descontaminación]
-    D --> E{¿Limpieza cumple?}
-    E -- No --> D1[Alerta y repetir limpieza]
-    D1 --> D
-    E -- Sí --> F[Inspección funcional]
-    F --> G{¿Completo y funcional?}
-    G -- No --> G1[Alerta, retiro o mantenimiento]
-    G -- Sí --> H[Empaque e indicador químico]
-    H --> I[Esterilización: equipo, ciclo, temperatura, presión]
-    I --> J[Validación: indicadores físico, químico y biológico]
-    J --> K{¿Carga liberada?}
-    K -- No --> K1[Rechazo de carga y reproceso]
-    K1 --> D
-    K -- Sí --> L[Almacenamiento con ubicación y vencimiento]
-    L --> M[Distribución a servicio destino]
-    M --> N[Reporte final de trazabilidad]
+
+    %% ── ESTILOS ──────────────────────────────────────────────────────────────
+    classDef etapa      fill:#0f3460,stroke:#00d4ff,color:#e2e8f0,rx:8
+    classDef decision   fill:#0a3060,stroke:#f59e0b,color:#fde68a,shape:diamond
+    classDef alarmaAlta fill:#7f1d1d,stroke:#ef4444,color:#fecaca,font-weight:bold
+    classDef alarmaMed  fill:#78350f,stroke:#f59e0b,color:#fde68a,font-weight:bold
+    classDef ok         fill:#14532d,stroke:#22c55e,color:#bbf7d0
+    classDef recall     fill:#581c87,stroke:#a855f7,color:#e9d5ff,font-weight:bold
+    classDef equipo     fill:#1e3a5f,stroke:#38bdf8,color:#bae6fd
+
+    %% ── INICIO ───────────────────────────────────────────────────────────────
+    INI(["🏥 Ingreso de instrumental contaminado"]):::etapa
+    REG["📋 Registro: código + lote\n──────────────\nValidación formato LOTE\nRegistro en audit_log"]:::etapa
+
+    INI --> REG
+
+    %% ── CICLO DE VIDA DEL INSTRUMENTAL ──────────────────────────────────────
+    CICLOS{"¿Ciclos ≥ máx\nfabricante?"}:::decision
+    REG --> CICLOS
+    CICLOS -- "Sí (≥100%)" --> AL_CICLOS_MAX["🔴 ALARMA ALTA\nLímite de ciclos superado\n→ Retirar del circuito"]:::alarmaAlta
+    CICLOS -- "≥80%" --> AL_CICLOS_PROX["🟡 ALARMA MEDIA\nCiclos próximos al límite\n→ Planificar reemplazo"]:::alarmaMed
+    CICLOS -- "OK" --> ETAPA_CAL
+    AL_CICLOS_MAX --> FIN_BAJA(["🚫 Baja definitiva\ndel instrumental"]):::alarmaAlta
+    AL_CICLOS_PROX --> ETAPA_CAL
+
+    %% ── VERIFICACIÓN DE EQUIPO ───────────────────────────────────────────────
+    ETAPA_CAL["🔩 Verificar calibración\ndel esterilizador"]:::equipo
+    CAL_OK{"¿Calibración\nvigente?"}:::decision
+    ETAPA_CAL --> CAL_OK
+    CAL_OK -- "Vencida" --> AL_CAL_VENC["🔴 ALARMA ALTA\nEquipo sin calibración vigente\n→ BLOQUEAR uso del equipo"]:::alarmaAlta
+    CAL_OK -- "≤30 días" --> AL_CAL_PROX["🟡 ALARMA MEDIA\nCalibración próxima a vencer\n→ Programar renovación"]:::alarmaMed
+    CAL_OK -- "Vigente" --> MANT_OK
+    AL_CAL_VENC --> BLOQUEO(["🚫 Equipo bloqueado\nhasta certificación"]):::alarmaAlta
+    AL_CAL_PROX --> MANT_OK
+
+    MANT_OK{"¿Mantenimiento\nvigente?"}:::decision
+    CAL_OK -- "Vigente" --> MANT_OK
+    MANT_OK -- "Vencido" --> AL_MANT["🔴 ALARMA ALTA\nMantenimiento vencido\n→ Suspender uso"]:::alarmaAlta
+    MANT_OK -- "≤30 días" --> AL_MANT_PROX["🟡 ALARMA MEDIA\nMantenimiento próximo\n→ Programar servicio"]:::alarmaMed
+    MANT_OK -- "OK" --> ET1
+    AL_MANT --> BLOQUEO
+    AL_MANT_PROX --> ET1
+
+    %% ── ETAPA 1: RECEPCIÓN ───────────────────────────────────────────────────
+    ET1["📥 1. RECEPCIÓN\n──────────────\nOrigen · estado inicial\ncantidad · responsable"]:::etapa
+
+    %% ── ETAPA 2: LIMPIEZA ────────────────────────────────────────────────────
+    ET2["🧪 2. LIMPIEZA Y DESCONTAMINACIÓN\n──────────────\nMétodo · tiempo · temperatura"]:::etapa
+    ET1 --> ET2
+    LIMP_OK{"¿Limpieza\ncumple?"}:::decision
+    ET2 --> LIMP_OK
+    LIMP_OK -- "No conforme" --> AL_LIMP["🔴 ALARMA ALTA\nLimpieza no conforme\n→ Repetir limpieza"]:::alarmaAlta
+    AL_LIMP --> ET2
+    LIMP_OK -- "Tiempo insuf." --> AL_TIEMPO_L["🟡 ALARMA MEDIA\nTiempo insuficiente en etapa\n→ Verificar registro"]:::alarmaMed
+    LIMP_OK -- "OK" --> ET3
+
+    %% ── ETAPA 3: INSPECCIÓN ──────────────────────────────────────────────────
+    ET3["🔍 3. INSPECCIÓN FUNCIONAL\n──────────────\nEstado: completo / incompleto\ndañado / oxidado"]:::etapa
+    AL_TIEMPO_L --> ET3
+    INSP_OK{"¿Estado\ndel instrumental?"}:::decision
+    ET3 --> INSP_OK
+    INSP_OK -- "Dañado / Oxidado\n/ Incompleto" --> AL_INS["🔴 ALARMA ALTA\nInstrumental dañado\n→ Retiro + mantenimiento"]:::alarmaAlta
+    AL_INS --> MANT_IQ(["🛠️ Mantenimiento\ncorrectivo"]):::equipo
+    INSP_OK -- "OK" --> ET4
+
+    %% ── ETAPA 4: EMPAQUE ─────────────────────────────────────────────────────
+    ET4["📦 4. EMPAQUE\n──────────────\nTipo de empaque\nIndicador químico externo + interno"]:::etapa
+    ET3 --> ET4
+    INSP_OK -- "OK" --> ET4
+    IND_EMP{"¿Indicador químico\nconforme?"}:::decision
+    ET4 --> IND_EMP
+    IND_EMP -- "No conforme" --> AL_IND_EMP["🔴 ALARMA ALTA\nIndicador no conforme\n→ Revisar empaque"]:::alarmaAlta
+    AL_IND_EMP --> ET4
+    IND_EMP -- "OK" --> INSU_OK
+
+    INSU_OK{"¿Insumos /\nlotes vigentes?"}:::decision
+    IND_EMP -- "OK" --> INSU_OK
+    INSU_OK -- "Vencido" --> AL_INSU_V["🔴 ALARMA ALTA\nInsumo vencido\n→ NO UTILIZAR"]:::alarmaAlta
+    INSU_OK -- "≤30 días" --> AL_INSU_P["🟡 ALARMA MEDIA\nInsumo próximo a vencer\n→ Planificar reposición"]:::alarmaMed
+    INSU_OK -- "OK" --> ET5
+    AL_INSU_P --> ET5
+
+    %% ── ETAPA 5: ESTERILIZACIÓN ──────────────────────────────────────────────
+    ET5["⚗️ 5. ESTERILIZACIÓN\n──────────────\nEquipo · ciclo · temperatura\npresión · tiempo de exposición"]:::etapa
+    PARAM_OK{"¿Parámetros\nprogramados OK?"}:::decision
+    ET5 --> PARAM_OK
+    PARAM_OK -- "Temperatura\ninsuficiente" --> AL_TEMP["🔴 ALARMA ALTA\nParámetro real insuficiente\n(temperatura)\n→ RECHAZAR CARGA"]:::alarmaAlta
+    PARAM_OK -- "Presión\ninsuficiente" --> AL_PRES["🔴 ALARMA ALTA\nParámetro real insuficiente\n(presión)\n→ RECHAZAR CARGA"]:::alarmaAlta
+    PARAM_OK -- "Exposición\ninsuficiente" --> AL_EXPO["🔴 ALARMA ALTA\nTiempo de exposición insuficiente\n→ RECHAZAR CARGA"]:::alarmaAlta
+    PARAM_OK -- "Tiempo etapa\ninsuficiente" --> AL_TIEMP["🟡 ALARMA MEDIA\nTiempo insuficiente en etapa\n→ Verificar registro"]:::alarmaMed
+    PARAM_OK -- "OK" --> ET6
+    AL_TEMP --> REPRO(["🔄 Reprocesar desde\nLimpieza"]):::alarmaAlta
+    AL_PRES --> REPRO
+    AL_EXPO --> REPRO
+    REPRO --> ET2
+
+    %% ── ETAPA 6: VALIDACIÓN ──────────────────────────────────────────────────
+    ET6["✅ 6. VALIDACIÓN / LIBERACIÓN\n──────────────\nIndicador físico · químico · biológico\nSupervisor de liberación"]:::etapa
+    AL_TIEMP --> ET6
+    IB_OK{"¿Indicador\nbiológico (IB)?"}:::decision
+    ET6 --> IB_OK
+    IB_OK -- "POSITIVO (crecimiento)" --> AL_IB["🔴 ALARMA ALTA CRÍTICA\nIndicador biológico POSITIVO\n→ Inmovilizar toda la carga\n→ Activar RECALL automático"]:::alarmaAlta
+    AL_IB --> RECALL(["🚨 RECALL ACTIVADO\nNotificar pacientes expuestos\nRes. 4816/2008 / ISO 13485"]):::recall
+    IB_OK -- "No conforme" --> AL_IB_NC["🔴 ALARMA ALTA\nIndicador biológico no conforme\n→ Rechazar carga"]:::alarmaAlta
+    AL_IB_NC --> REPRO
+    IQ_VAL{"¿Indicador químico\nde validación?"}:::decision
+    IB_OK -- "Conforme" --> IQ_VAL
+    IQ_VAL -- "No conforme" --> AL_IQ_VAL["🔴 ALARMA ALTA\nIndicador no conforme\nen validación"]:::alarmaAlta
+    AL_IQ_VAL --> REPRO
+    LIB_OK{"¿Carga\nliberada?"}:::decision
+    IQ_VAL -- "Conforme" --> LIB_OK
+    LIB_OK -- "No" --> AL_LIB["🔴 ALARMA ALTA\nValidación pendiente\n→ No distribuir"]:::alarmaAlta
+    LIB_OK -- "No" --> AL_CICLO["🔴 ALARMA ALTA\nCiclo rechazado\n→ Reprocesar"]:::alarmaAlta
+    AL_LIB --> REPRO
+    AL_CICLO --> REPRO
+    LIB_OK -- "Sí" --> ET7
+
+    %% ── ETAPA 7: ALMACENAMIENTO ──────────────────────────────────────────────
+    ET7["🗃️ 7. ALMACENAMIENTO\n──────────────\nUbicación · fecha vencimiento\ncondición del paquete"]:::etapa
+    PKG_OK{"¿Condición\ndel paquete?"}:::decision
+    ET7 --> PKG_OK
+    PKG_OK -- "Dañado / Vencido" --> AL_PKG["🔴 ALARMA ALTA\nPaquete no apto\n→ No distribuir"]:::alarmaAlta
+    PKG_OK -- "Vencimiento ≤7 días" --> AL_PKG_P["🟡 ALARMA MEDIA\nVencimiento próximo\n→ Planificar uso urgente"]:::alarmaMed
+    PKG_OK -- "Paquete vencido" --> AL_PKG_V["🔴 ALARMA ALTA\nPaquete vencido\n→ Reprocesar"]:::alarmaAlta
+    AL_PKG --> REPRO
+    AL_PKG_V --> REPRO
+    PKG_OK -- "OK" --> ET8
+    AL_PKG_P --> ET8
+
+    %% ── ETAPA 8: DISTRIBUCIÓN ────────────────────────────────────────────────
+    ET8["🚚 8. DISTRIBUCIÓN\n──────────────\nServicio destino · responsable\nVínculo con paciente / quirófano"]:::etapa
+    DIST_OK{"¿Estado en\nentrega?"}:::decision
+    ET8 --> DIST_OK
+    DIST_OK -- "Sin liberación\naprobada" --> AL_DIST_LIB["🔴 ALARMA ALTA\nValidación pendiente\n→ No distribuir hasta liberar"]:::alarmaAlta
+    DIST_OK -- "Paquete dañado" --> AL_DIST_PKG["🔴 ALARMA ALTA\nPaquete dañado en entrega\n→ Riesgo directo al paciente"]:::alarmaAlta
+    AL_DIST_PKG --> RECALL
+    DIST_OK -- "OK" --> ET8_REG["📝 Registro de\nvinculación paciente"]:::ok
+    ET8_REG --> FIN
+
+    %% ── CONTROL TRANSVERSAL ──────────────────────────────────────────────────
+    ETAPA_DUP["🟡 ALARMA MEDIA\nEtapa duplicada\n→ Verificar si es\nreproceso o error"]:::alarmaMed
+    INCUMP["🔴 ALARMA ALTA\nIncumplimiento de protocolo\n→ Documentar desviación"]:::alarmaAlta
+    INCUMP --> REPRO
+
+    %% ── FIN ──────────────────────────────────────────────────────────────────
+    NC["📋 No Conformidad\nabierta → Plan\nde mejora"]:::alarmaMed
+    FIN(["📊 Trazabilidad completa\nExport PDF · Excel · QR\nScorecard normativo"]):::ok
+    RECALL --> NC
+    NC --> FIN

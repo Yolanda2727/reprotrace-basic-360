@@ -2232,13 +2232,45 @@ def dashboard():
     bi_pend_n = int(bi_pend.iloc[0]["n"]) if not bi_pend.empty else 0
     bi_pos=query_df("SELECT COUNT(*) as n FROM biological_indicators WHERE result='Positivo'")
     bi_pos_n = int(bi_pos.iloc[0]["n"]) if not bi_pos.empty else 0
-    c1,c2,c3,c4,c5,c6=st.columns(6)
-    c1.metric("🔧 Instrumentales",len(ins))
-    c2.metric("📋 Registros",len(rec))
-    c3.metric("🔔 Alertas abiertas",len(al))
-    c4.metric("✅ Cumplimiento",f"{(rec['complies']=='Sí').mean()*100:.1f}%" if not rec.empty else "N/A")
-    c5.metric("📌 Planes pendientes",len(pl))
-    c6.metric("🧫 IB pendientes", bi_pend_n, help="Indicadores biológicos en incubación o sin lectura")
+
+    # ── Tasa de conformidad global por lote (indicador CSSD) ─────────────────
+    # Definición: promedio de (etapas_registradas / 8 etapas_esperadas) por lote
+    # Referencia: OPS/OMS Guía CEyE 2016 | ISO 13485:2016 §8.4 | AAMI ST79 §4
+    if not rec.empty:
+        _lote_etapas = (
+            rec.groupby(["instrument_code", "batch_code"])["stage"]
+            .apply(lambda s: len(set(s) & set(STAGES)))
+            .reset_index(name="etapas_ok")
+        )
+        _total_esperadas = len(STAGES)  # 8
+        _lotes_completos = int((_lote_etapas["etapas_ok"] >= _total_esperadas).sum())
+        _n_lotes = len(_lote_etapas)
+        _tasa_conf = round(_lote_etapas["etapas_ok"].sum() / (_n_lotes * _total_esperadas) * 100, 1)
+        _tasa_conf_str = f"{_tasa_conf}%"
+        _tasa_conf_delta = f"{_lotes_completos}/{_n_lotes} lotes completos"
+    else:
+        _tasa_conf_str  = "N/A"
+        _tasa_conf_delta = None
+
+    c1,c2,c3,c4,c5,c6,c7=st.columns(7)
+    c1.metric("🔧 Instrumentales", len(ins))
+    c2.metric("📋 Registros", len(rec))
+    c3.metric("🔔 Alertas abiertas", len(al))
+    c4.metric("✅ Cumplimiento etapas",
+              f"{(rec['complies']=='Sí').mean()*100:.1f}%" if not rec.empty else "N/A")
+    c5.metric("📌 Planes pendientes", len(pl))
+    c6.metric("🧫 IB pendientes", bi_pend_n,
+              help="Indicadores biológicos en incubación o sin lectura")
+    c7.metric("📊 Conformidad global",
+              _tasa_conf_str,
+              delta=_tasa_conf_delta,
+              delta_color="off",
+              help=(
+                  "Tasa de conformidad global por lote: "
+                  "promedio de etapas completadas / 8 etapas esperadas por lote. "
+                  "Indicador clave en literatura CSSD. "
+                  "Referencia: OPS/OMS Guía CEyE 2016 | AAMI ST79 §4 | ISO 13485:2016 §8.4"
+              ))
     red=len(al[al["severity"]=="Alta"]) if not al.empty else 0
     if bi_pos_n:
         st.error(f"🚨 {bi_pos_n} INDICADOR(ES) BIOLÓGICO(S) **POSITIVOS** — Revise el módulo '📊 Indicadores (F / Q / B)'.")
@@ -2277,7 +2309,73 @@ def dashboard():
         f"Scorecard global: **{prev_global}%** · Meta: {int(sc_mini_target)}% · "
         "Ver módulo '📋 Scorecard normativo' para análisis detallado."
     )
-    # ── Mini-panel de mantenimiento de equipos ────────────────────────────────
+
+    # ── Detalle de conformidad global por lote ────────────────────────────────
+    if not rec.empty and _n_lotes > 0:
+        st.markdown("---")
+        st.subheader("📊 Conformidad global por lote (CSSD)")
+        st.caption(
+            f"Meta recomendada: **100 %** de etapas completas por lote. "
+            f"Referencia: OPS/OMS Guía CEyE 2016 · AAMI ST79 §4 · ISO 13485:2016 §8.4"
+        )
+        _kd1, _kd2, _kd3 = st.columns(3)
+        _kd1.metric("Lotes evaluados",        _n_lotes)
+        _kd2.metric("Lotes con 8/8 etapas",   _lotes_completos,
+                    delta=f"{round(_lotes_completos/_n_lotes*100,1)}% del total",
+                    delta_color="off")
+        _kd3.metric("Tasa de conformidad",     _tasa_conf_str,
+                    delta="meta: 100%" , delta_color="off")
+
+        # Tabla de lotes con etapas completadas y faltantes
+        _lote_etapas_det = (
+            rec.groupby(["instrument_code", "batch_code"])["stage"]
+            .apply(lambda s: list(set(s) & set(STAGES)))
+            .reset_index(name="etapas_registradas")
+        )
+        _lote_etapas_det["completadas"] = _lote_etapas_det["etapas_registradas"].apply(len)
+        _lote_etapas_det["faltantes"]   = _lote_etapas_det["etapas_registradas"].apply(
+            lambda s: ", ".join([e for e in STAGES if e not in s]) or "—"
+        )
+        _lote_etapas_det["conformidad"] = _lote_etapas_det["completadas"].apply(
+            lambda n: f"{round(n/_total_esperadas*100,1)}%"
+        )
+        _lote_etapas_det["estado"] = _lote_etapas_det["completadas"].apply(
+            lambda n: "✅ Completo" if n >= _total_esperadas else f"⚠️ Incompleto ({n}/{_total_esperadas})"
+        )
+        _tabla_conf = _lote_etapas_det[
+            ["instrument_code","batch_code","completadas","conformidad","estado","faltantes"]
+        ].copy()
+        _tabla_conf.columns = ["Código","Lote","Etapas OK","Conformidad","Estado","Etapas faltantes"]
+        _tabla_conf = _tabla_conf.sort_values("Etapas OK", ascending=True).reset_index(drop=True)
+
+        # Gráfica de barras horizontales por lote
+        plt = _get_plt()
+        _conf_vals = _lote_etapas_det["completadas"].values / _total_esperadas * 100
+        _conf_lbls = (_lote_etapas_det["instrument_code"] + " / "
+                      + _lote_etapas_det["batch_code"]).values
+        _colors = ["#22c55e" if v >= 100 else "#f59e0b" if v >= 50 else "#ef4444"
+                   for v in _conf_vals]
+        _fig_conf, _ax_conf = plt.subplots(figsize=(8, max(2, len(_conf_vals) * 0.45)))
+        _ax_conf.barh(_conf_lbls, _conf_vals, color=_colors, height=0.6)
+        _ax_conf.axvline(100, color="#555", linestyle="--", linewidth=1, label="Meta 100 %")
+        _ax_conf.set_xlim(0, 110)
+        _ax_conf.set_xlabel("Conformidad (%)")
+        _ax_conf.set_title(
+            "Tasa de conformidad global por lote\n"
+            "OPS/OMS CEyE 2016 · AAMI ST79 §4 · ISO 13485:2016 §8.4",
+            fontsize=9,
+        )
+        for i, v in enumerate(_conf_vals):
+            _ax_conf.text(v + 1, i, f"{v:.0f}%", va="center", fontsize=8)
+        _ax_conf.legend(fontsize=8)
+        _fig_conf.tight_layout()
+
+        _gc1, _gc2 = st.columns([2, 3])
+        with _gc1:
+            st.dataframe(_tabla_conf, use_container_width=True, hide_index=True)
+        with _gc2:
+            st.pyplot(_fig_conf)
+        plt.close(_fig_conf)
     _df_maint_dash = query_df(
         "SELECT equipment_id, equipment_name, next_maintenance_date "
         "FROM equipment_maintenance "
@@ -3092,6 +3190,50 @@ def traceability_module():
             )
     else:
         st.warning("⚠️ Librería 'qrcode' no disponible. Instale con: pip install 'qrcode[pil]'")
+
+    # ─ Diagrama de flujo del proceso ─────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("📊 Diagrama de flujo del proceso de reprocesamiento", expanded=False):
+        st.caption(
+            "Representación visual de las 8 etapas y sus puntos de decisión. "
+            "Fuente: diagrama_trazabilidad_auditado.mmd"
+        )
+        _mmd_path = "diagrama_trazabilidad_auditado.mmd"
+        _mmd_content = _read_text_file(_mmd_path)
+        if _mmd_content:
+            _mermaid_html = (
+                "<div style='background:#0d1b35;border:1px solid #1e3a5f;"
+                "border-radius:12px;padding:1.5rem;overflow:auto;'>"
+                "<pre class='mermaid' style='background:transparent;'>"
+                + _mmd_content
+                + "</pre></div>"
+                "<script type='module'>"
+                "import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';"
+                "mermaid.initialize({"
+                "  startOnLoad: true,"
+                "  theme: 'dark',"
+                "  themeVariables: {"
+                "    primaryColor: '#0f3460',"
+                "    primaryTextColor: '#e2e8f0',"
+                "    primaryBorderColor: '#00d4ff',"
+                "    lineColor: '#7fb3d3',"
+                "    background: '#0d1b35'"
+                "  }"
+                "});"
+                "</script>"
+            )
+            st_components.html(_mermaid_html, height=1800, scrolling=True)
+            if os.path.exists(_mmd_path):
+                with open(_mmd_path, "r", encoding="utf-8") as _mmd_f:
+                    st.download_button(
+                        "📥 Descargar diagrama (.mmd)",
+                        data=_mmd_f.read(),
+                        file_name="diagrama_trazabilidad.mmd",
+                        mime="text/plain",
+                        use_container_width=False,
+                    )
+        else:
+            st.warning("⚠️ No se encontró el archivo diagrama_trazabilidad_auditado.mmd")
 
 # ─── Retiro de lote / Recall ──────────────────────────────────────────────────
 def recall_module():
@@ -4429,15 +4571,179 @@ def survey_module():
 # ─── Auditoría ────────────────────────────────────────────────────────────────
 def audit_module():
     st.header("8. Auditoría de cambios")
-    st.info("💡 Registro automático de todas las acciones del sistema.")
-    df=query_df("SELECT * FROM audit_log ORDER BY created_at DESC")
-    fc1,fc2=st.columns(2)
-    fu=fc1.text_input("Filtrar usuario"); fm=fc2.text_input("Filtrar módulo")
-    if fu: df=df[df["username"].str.contains(fu,case=False,na=False)]
-    if fm: df=df[df["module"].str.contains(fm,case=False,na=False)]
-    st.dataframe(df,use_container_width=True)
+    st.info("💡 Registro automático de todas las acciones del sistema. "
+            "Referencia: ISO 13485:2016 §8.5 — análisis de datos y revisión periódica.")
+    df = query_df("SELECT * FROM audit_log ORDER BY created_at DESC")
+
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    with st.expander("🔍 Filtros", expanded=True):
+        fr1, fr2 = st.columns(2)
+        fu = fr1.text_input("Usuario", placeholder="admin, central…", key="aud_fu")
+        fm = fr2.text_input("Módulo",  placeholder="Login, Instrumental…", key="aud_fm")
+
+        fr3, fr4, fr5 = st.columns(3)
+        fa = fr3.text_input("Acción (contiene)", placeholder="Registro, Cierre…", key="aud_fa")
+
+        # Rango de fechas — ISO 13485:2016 §8.5
+        _min_date = date(2024, 1, 1)
+        _max_date = date.today()
+        fd_desde = fr4.date_input("Desde", value=_min_date,
+                                   min_value=_min_date, max_value=_max_date,
+                                   key="aud_fd_desde")
+        fd_hasta = fr5.date_input("Hasta", value=_max_date,
+                                   min_value=_min_date, max_value=_max_date,
+                                   key="aud_fd_hasta")
+
+    # ── Aplicar filtros ────────────────────────────────────────────────────────
+    if fu:
+        df = df[df["username"].str.contains(fu, case=False, na=False)]
+    if fm:
+        df = df[df["module"].str.contains(fm, case=False, na=False)]
+    if fa:
+        df = df[df["action"].str.contains(fa, case=False, na=False)]
+
+    # Filtro por rango de fechas sobre el campo created_at (ISO 8601)
+    if not df.empty and "created_at" in df.columns:
+        df["_date"] = pd.to_datetime(df["created_at"], errors="coerce").dt.date
+        df = df[
+            (df["_date"] >= fd_desde) &
+            (df["_date"] <= fd_hasta)
+        ]
+        df = df.drop(columns=["_date"])
+
+    # ── Métricas rápidas ───────────────────────────────────────────────────────
+    if not df.empty:
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Registros filtrados", len(df))
+        mc2.metric("Usuarios distintos",  df["username"].nunique())
+        mc3.metric("Módulos distintos",   df["module"].nunique())
+        mc4.metric("Rango seleccionado",  f"{fd_desde} → {fd_hasta}")
+    else:
+        st.warning("No hay registros para los filtros aplicados.")
+
+    st.dataframe(df, use_container_width=True)
+
+    # ── Exportar log filtrado a Excel ──────────────────────────────────────────
+    if not df.empty:
+        _buf = io.BytesIO()
+        with pd.ExcelWriter(_buf, engine="xlsxwriter") as _w:
+            _wb  = _w.book
+            _hf  = _wb.add_format({"bold": True, "bg_color": "#1F4E79",
+                                    "font_color": "white", "border": 1})
+            _tf  = _wb.add_format({"bold": True, "font_size": 12})
+            df.to_excel(_w, sheet_name="Auditoria", index=False, startrow=2)
+            _ws = _w.sheets["Auditoria"]
+            _ws.write(0, 0,
+                      f"{APP_NAME} – Auditoría – {fd_desde} al {fd_hasta} – "
+                      f"{datetime.now().strftime('%Y-%m-%d %H:%M')}", _tf)
+            for _i, _col in enumerate(df.columns):
+                _ws.write(2, _i, _col, _hf)
+                _cw = max(len(str(_col)) + 4,
+                           df[_col].astype(str).str.len().max() + 2 if not df.empty else 10)
+                _ws.set_column(_i, _i, min(_cw, 50))
+            _ws.autofilter(2, 0, 2 + len(df), len(df.columns) - 1)
+        _buf.seek(0)
+        st.download_button(
+            "📥 Exportar log filtrado (Excel)",
+            data=_buf.read(),
+            file_name=f"auditoria_{fd_desde}_{fd_hasta}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=False,
+        )
 
 # ─── Configuración y respaldo ─────────────────────────────────────────────────
+def _export_db_json() -> bytes:
+    """Exporta todas las tablas de la BD a un único JSON estructurado.
+
+    Formato:
+      {
+        "meta": { app, version, exported_at, tables },
+        "data": { tabla: [ {col: val, ...}, ... ], ... }
+      }
+
+    Los valores de tipo date/datetime se serializan como cadenas ISO 8601.
+    Útil para restaurar datos en entornos donde la BD SQLite se recrea
+    (p. ej. Streamlit Cloud). No incluye la tabla 'users' por seguridad.
+    """
+    TABLES_EXPORT = [
+        "instruments", "process_records", "alerts", "improvement_plans",
+        "staff_survey", "audit_log", "login_sessions",
+        "patient_deliveries", "recall_events",
+        "equipment_calibration", "equipment_maintenance",
+        "nonconformities", "biological_indicators",
+        "surgical_sets", "set_instruments",
+        "consumable_lots",
+    ]
+    payload = {
+        "meta": {
+            "app":         APP_NAME,
+            "version":     VERSION,
+            "exported_at": datetime.now().isoformat(),
+            "tables":      TABLES_EXPORT,
+            "note":        "Exportación académica. No incluye tabla 'users' por seguridad.",
+        },
+        "data": {},
+    }
+    for tbl in TABLES_EXPORT:
+        try:
+            df = query_df(f"SELECT * FROM {tbl}")  # noqa: S608 — tabla controlada por lista estática
+            payload["data"][tbl] = json.loads(
+                df.to_json(orient="records", date_format="iso", force_ascii=False)
+            )
+        except Exception:
+            payload["data"][tbl] = []
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _import_db_json(raw: bytes, user: str) -> tuple[int, int, list[str]]:
+    """Restaura datos desde un JSON exportado por _export_db_json().
+
+    Inserta filas usando INSERT OR IGNORE para no sobreescribir datos existentes.
+    Devuelve (tablas_ok, filas_totales, errores[]).
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return 0, 0, [f"JSON inválido: {exc}"]
+
+    if "data" not in payload:
+        return 0, 0, ["El JSON no tiene la clave 'data'. ¿Es un export válido?"]
+
+    tablas_ok  = 0
+    filas_tot  = 0
+    errores    = []
+
+    for tbl, rows in payload["data"].items():
+        if not rows:
+            continue
+        try:
+            df = pd.DataFrame(rows)
+            conn = connect()
+            # Obtener columnas reales de la tabla en BD
+            cols_bd = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]  # noqa: S608
+            # Filtrar solo columnas que existen en la tabla actual (tolerancia a versiones)
+            cols_use = [c for c in df.columns if c in cols_bd and c != "id"]
+            if not cols_use:
+                conn.close()
+                continue
+            df_use = df[cols_use]
+            placeholders = ", ".join(["?" ] * len(cols_use))
+            col_names    = ", ".join(cols_use)
+            sql = f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})"  # noqa: S608
+            cur = conn.cursor()
+            cur.executemany(sql, df_use.values.tolist())
+            conn.commit()
+            filas_tot += cur.rowcount
+            conn.close()
+            tablas_ok += 1
+        except Exception as exc:
+            errores.append(f"{tbl}: {exc}")
+
+    audit(user, "Importar JSON", "Config",
+          f"Tablas restauradas: {tablas_ok} | Filas insertadas: {filas_tot}")
+    return tablas_ok, filas_tot, errores
+
+
 def config_module():
     st.header("9. Configuración y respaldo")
     st.subheader("Respaldar base de datos")
@@ -4453,6 +4759,62 @@ def config_module():
             zf.writestr("reporte.xlsx",generate_excel())
         zb.seek(0)
         st.download_button("⬇️ Descargar ZIP",zb.read(),file_name="reprotrace_datos.zip")
+
+    # ── Exportar / Importar JSON ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔄 Exportar / Importar datos en JSON")
+    st.caption(
+        "El JSON contiene todas las tablas del sistema (excepto usuarios). "
+        "Úsalo para restaurar datos en Streamlit Cloud tras un reinicio, "
+        "compartir datos entre entornos o hacer respaldos portables."
+    )
+    _jc1, _jc2 = st.columns(2)
+
+    with _jc1:
+        st.markdown("**📤 Exportar**")
+        if st.button("Generar JSON completo", use_container_width=True, key="btn_export_json"):
+            with st.spinner("Exportando…"):
+                _json_bytes = _export_db_json()
+            _fname_json = f"reprotrace_{date.today()}.json"
+            st.download_button(
+                "⬇️ Descargar JSON",
+                data=_json_bytes,
+                file_name=_fname_json,
+                mime="application/json",
+                use_container_width=True,
+                key="dl_json",
+            )
+            st.success(f"JSON generado ({len(_json_bytes)/1024:.1f} KB). Haz clic en '⬇️ Descargar JSON'.")
+
+    with _jc2:
+        st.markdown("**📥 Importar** *(restaurar desde JSON)*")
+        st.warning(
+            "⚠️ Solo disponible para **Administrador**. "
+            "Usa INSERT OR IGNORE: no sobreescribe registros existentes.",
+            icon="⚠️",
+        )
+        if st.session_state.get("role") == "Administrador":
+            _up = st.file_uploader(
+                "Selecciona el archivo JSON exportado",
+                type=["json"],
+                key="cfg_json_upload",
+            )
+            if _up is not None:
+                if st.button("▶ Restaurar datos desde JSON",
+                             use_container_width=True, key="btn_import_json"):
+                    with st.spinner("Importando…"):
+                        _t_ok, _f_tot, _errs = _import_db_json(_up.read(),
+                                                                st.session_state["user"])
+                    if _errs:
+                        for _e in _errs:
+                            st.error(f"❌ {_e}")
+                    st.success(
+                        f"✅ Restauración completa: {_t_ok} tabla(s) procesada(s), "
+                        f"{_f_tot} fila(s) insertada(s)."
+                    )
+                    st.rerun()
+        else:
+            st.info("Inicia sesión como Administrador para importar datos.")
     st.subheader("Sesiones registradas")
     st.dataframe(query_df("SELECT * FROM login_sessions ORDER BY id DESC LIMIT 50"),use_container_width=True)
     if st.session_state.get("role")=="Administrador":
