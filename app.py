@@ -2396,13 +2396,12 @@ def dashboard():
     st.subheader("📋 Cumplimiento normativo (resumen)")
     sc_mini = _compute_scorecard()
     sc_mini_target = 90.0   # meta fija para el dashboard; ajustable en el módulo completo
+    prev_global = round(sum(v["score"] for v in sc_mini.values()) / len(sc_mini), 1) if sc_mini else 0.0
     cms = st.columns(len(sc_mini))
     for i_s, (norm_s, data_s) in enumerate(sc_mini.items()):
         s_val = data_s["score"]
         ico_s = _sc_semaforo(s_val, sc_mini_target)
-        clr_s = _sc_color(s_val, sc_mini_target)
         lbl_s = norm_s.replace(" §9", "").replace(" / EN 285", "/EN285")
-        prev_global = round(sum(v["score"] for v in sc_mini.values()) / len(sc_mini), 1)
         cms[i_s].metric(
             label=f"{ico_s} {lbl_s}",
             value=f"{s_val}%",
@@ -2454,13 +2453,13 @@ def dashboard():
         _tabla_conf = _tabla_conf.sort_values("Etapas OK", ascending=True).reset_index(drop=True)
 
         # Gráfica de barras horizontales por lote
-        plt = _get_plt()
+        _plt_kpi = _get_plt()
         _conf_vals = _lote_etapas_det["completadas"].values / _total_esperadas * 100
         _conf_lbls = (_lote_etapas_det["instrument_code"] + " / "
                       + _lote_etapas_det["batch_code"]).values
         _colors = ["#22c55e" if v >= 100 else "#f59e0b" if v >= 50 else "#ef4444"
                    for v in _conf_vals]
-        _fig_conf, _ax_conf = plt.subplots(figsize=(8, max(2, len(_conf_vals) * 0.45)))
+        _fig_conf, _ax_conf = _plt_kpi.subplots(figsize=(8, max(2, len(_conf_vals) * 0.45)))
         _ax_conf.barh(_conf_lbls, _conf_vals, color=_colors, height=0.6)
         _ax_conf.axvline(100, color="#555", linestyle="--", linewidth=1, label="Meta 100 %")
         _ax_conf.set_xlim(0, 110)
@@ -2480,7 +2479,7 @@ def dashboard():
             st.dataframe(_tabla_conf, use_container_width=True, hide_index=True)
         with _gc2:
             st.pyplot(_fig_conf)
-        plt.close(_fig_conf)
+        _plt_kpi.close(_fig_conf)
     _df_maint_dash = query_df(
         "SELECT equipment_id, equipment_name, next_maintenance_date "
         "FROM equipment_maintenance "
@@ -4818,23 +4817,38 @@ def _import_db_json(raw: bytes, user: str) -> tuple[int, int, list[str]]:
     filas_tot  = 0
     errores    = []
 
+    # Whitelist estricta: solo tablas conocidas del sistema (OWASP A03 — SQL Injection)
+    _ALLOWED_TABLES = {
+        "instruments", "process_records", "alerts", "improvement_plans",
+        "staff_survey", "audit_log", "login_sessions",
+        "patient_deliveries", "recall_events",
+        "equipment_calibration", "equipment_maintenance",
+        "nonconformities", "biological_indicators",
+        "surgical_sets", "set_instruments",
+        "consumable_lots",
+    }
+
     for tbl, rows in payload["data"].items():
+        # Rechazar tabla no autorizada — previene SQL injection desde JSON malicioso
+        if tbl not in _ALLOWED_TABLES:
+            errores.append(f"Tabla '{tbl}' no permitida — omitida por seguridad.")
+            continue
         if not rows:
             continue
         try:
             df = pd.DataFrame(rows)
             conn = connect()
             # Obtener columnas reales de la tabla en BD
-            cols_bd = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]  # noqa: S608
+            cols_bd = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]  # noqa: S608 — tbl validado contra whitelist
             # Filtrar solo columnas que existen en la tabla actual (tolerancia a versiones)
             cols_use = [c for c in df.columns if c in cols_bd and c != "id"]
             if not cols_use:
                 conn.close()
                 continue
             df_use = df[cols_use]
-            placeholders = ", ".join(["?" ] * len(cols_use))
+            placeholders = ", ".join(["?"] * len(cols_use))
             col_names    = ", ".join(cols_use)
-            sql = f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})"  # noqa: S608
+            sql = f"INSERT OR IGNORE INTO {tbl} ({col_names}) VALUES ({placeholders})"  # noqa: S608 — tbl validado
             cur = conn.cursor()
             cur.executemany(sql, df_use.values.tolist())
             conn.commit()
